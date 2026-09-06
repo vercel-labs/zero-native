@@ -303,6 +303,10 @@ pub fn build(b: *std.Build) void {
         else
             &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0" };
         desktop_mod.addCSourceFile(.{ .file = b.path("src/platform/macos/image_fit_test.m"), .flags = flags });
+        desktop_mod.addCSourceFile(.{ .file = b.path("src/platform/macos/text_baseline_test.m"), .flags = flags });
+        desktop_mod.linkFramework("AppKit", .{});
+        desktop_mod.linkFramework("CoreGraphics", .{});
+        desktop_mod.linkFramework("CoreText", .{});
         desktop_mod.linkFramework("Foundation", .{});
         desktop_mod.linkFramework("ImageIO", .{});
         desktop_mod.linkSystemLibrary("objc", .{});
@@ -1430,8 +1434,9 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketTextLineBreakMode" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketTextAlignment" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "static BOOL NativeSdkPacketDrawAttributedText(" },
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "drawGlyphsForGlyphRange:glyphRange atPoint:" },
-        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "glyphRangeForTextContainer:container" },
+        .{ .path = "src/platform/macos/appkit_host.m", .pattern = "return NativeSdkAppKitDrawAttributedText(value, attributes, x, baseline, width, height, NULL)" },
+        .{ .path = "src/platform/macos/appkit_text_baseline.h", .pattern = "drawGlyphsForGlyphRange:glyphRange atPoint:" },
+        .{ .path = "src/platform/macos/appkit_text_baseline.h", .pattern = "glyphRangeForTextContainer:container" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "NativeSdkPacketNumber(layout[@\"maxWidth\"], 0)" },
         .{ .path = "src/platform/macos/appkit_host.m", .pattern = "native_sdk_appkit_measure_text_ink(" },
     });

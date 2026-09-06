@@ -69,6 +69,9 @@ jobs:
       # gpu-components is a TypeScript-core app, so its smoke build needs
       # the frontend compiler and exact-pinned TypeScript toolchain.
       - run: npm ci --prefix packages/core
+      # Platform-only framework tests include AppKit pixel regressions that
+      # are compiled out of the Linux Zig Core lane.
+      - run: zig build test-desktop-platform
       # The mobile aggregate runs on Linux for Android. Exercise the other
       # store-capable cross-target here against the real iPhone simulator SDK.
       - run: zig build test-example-mobile-canvas-lib-ios-store
