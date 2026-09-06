@@ -216,6 +216,24 @@ test "markup view builds the same tree as the hand-written view" {
     );
 }
 
+test "digit-only text attributes stay text while numeric attributes stay numeric" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var view = try InboxMarkup.init(
+        arena,
+        "<column padding=\"8\">\n  <text-field placeholder=\"123\" label=\"456\" />\n</column>",
+    );
+    var ui = InboxUi.init(arena);
+    const tree = try ui.finalize(try view.build(&ui, &Model{}));
+    const field = findByKind(tree.root, .text_field).?;
+
+    try testing.expectEqualStrings("123", field.placeholder);
+    try testing.expectEqualStrings("456", field.semantics.label);
+    try testing.expectEqual(@as(f32, 8), tree.root.layout.padding.top);
+}
+
 test "markup keyed rows keep ids across model changes and filters dispatch" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

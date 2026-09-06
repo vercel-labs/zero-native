@@ -203,6 +203,15 @@ const fixtures = [_]Fixture{
         .expect = null,
     },
     .{
+        .name = "digit-only text attributes remain text",
+        .source =
+        \\<column padding="8">
+        \\  <text-field placeholder="123" label="456" />
+        \\</column>
+        ,
+        .expect = null,
+    },
+    .{
         .name = "a missing model field rejects",
         .source =
         \\<column>

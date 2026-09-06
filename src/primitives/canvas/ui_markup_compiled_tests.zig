@@ -170,6 +170,32 @@ const selection_label_content_markup =
 ;
 const SelectionLabelContentCompiled = canvas.CompiledMarkupView(fixture.Model, fixture.Msg, selection_label_content_markup);
 
+const digit_text_attribute_markup =
+    \\<column padding="8">
+    \\  <text-field placeholder="123" label="456" />
+    \\</column>
+;
+const DigitTextAttributeCompiled = canvas.CompiledMarkupView(fixture.Model, fixture.Msg, digit_text_attribute_markup);
+
+test "compiled digit-only text attributes stay text while numeric attributes stay numeric" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const model = fixture.Model{};
+
+    var interpreter = try InboxInterpreter.init(arena, digit_text_attribute_markup);
+    var interpreter_ui = InboxUi.init(arena);
+    const interpreted = try interpreter_ui.finalize(try interpreter.build(&interpreter_ui, &model));
+    var compiled_ui = InboxUi.init(arena);
+    const compiled = try compiled_ui.finalize(DigitTextAttributeCompiled.build(&compiled_ui, &model));
+
+    try expectSameTree(fixture.Msg, interpreted, compiled);
+    const field = fixture.findByKind(compiled.root, .text_field).?;
+    try testing.expectEqualStrings("123", field.placeholder);
+    try testing.expectEqualStrings("456", field.semantics.label);
+    try testing.expectEqual(@as(f32, 8), compiled.root.layout.padding.top);
+}
+
 test "checkbox and radio element content builds identically in both markup engines" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -1741,7 +1741,7 @@ pub fn MarkupView(comptime ModelT: type, comptime MsgT: type) type {
                     }
                 }
             }
-            return .{ .value = try self.evalAttrExpression(scope, node, attribute) };
+            return .{ .value = try self.evalUnclassifiedExpression(scope, node, attribute) };
         }
 
         fn failPayload(self: *Self, node: markup.MarkupNode, message: []const u8) BuildError {
@@ -2443,9 +2443,12 @@ pub fn MarkupView(comptime ModelT: type, comptime MsgT: type) type {
         /// classified (and its expression tree parsed) once at document
         /// level, not per frame per use — the typed-document pass's whole
         /// point for the interpreter.
-        fn evalAttrExpression(self: *Self, scope: *Scope, node: markup.MarkupNode, attribute: markup.MarkupAttr) BuildError!Value {
+        fn evalAttributeExpression(self: *Self, scope: *Scope, node: markup.MarkupNode, attribute: markup.MarkupAttr, attribute_aware: bool) BuildError!Value {
             return switch (markup.attrTyped(attribute)) {
-                .literal => |text| literalValue(text),
+                .literal => |text| if (attribute_aware)
+                    literalValueForAttribute(text, attribute.name)
+                else
+                    literalValue(text),
                 .binding => |path| try self.evalBinding(scope, node, path, true),
                 // Arena-computed bindings are excluded from equality on
                 // purpose: comparing freshly formatted strings is a smell —
@@ -2457,6 +2460,14 @@ pub fn MarkupView(comptime ModelT: type, comptime MsgT: type) type {
                 .expression => |form| try self.evalExpressionForm(scope, node, form),
                 .message, .invalid => self.failValue(node, markup.invalid_expression_message),
             };
+        }
+
+        fn evalAttrExpression(self: *Self, scope: *Scope, node: markup.MarkupNode, attribute: markup.MarkupAttr) BuildError!Value {
+            return self.evalAttributeExpression(scope, node, attribute, true);
+        }
+
+        fn evalUnclassifiedExpression(self: *Self, scope: *Scope, node: markup.MarkupNode, attribute: markup.MarkupAttr) BuildError!Value {
+            return self.evalAttributeExpression(scope, node, attribute, false);
         }
 
         /// A typed expression: use the pre-parsed tree when the pass
@@ -2893,6 +2904,7 @@ pub fn valueOf(comptime T: type, value: T) ?Value {
 }
 
 pub const literalValue = reflect.literalValue;
+pub const literalValueForAttribute = reflect.literalValueForAttribute;
 
 /// Display-text formatting for interpolation and `++` concatenation:
 /// defined once in the expression core so both engines (and the evaluator
