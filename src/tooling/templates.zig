@@ -1927,6 +1927,8 @@ fn buildZig(allocator: std.mem.Allocator, names: TemplateNames, framework_path: 
         \\        app_mod.linkSystemLibrary("user32", .{});
         \\        app_mod.linkSystemLibrary("gdi32", .{});
         \\        app_mod.linkSystemLibrary("d2d1", .{});
+        \\        app_mod.linkSystemLibrary("d3d11", .{});
+        \\        app_mod.linkSystemLibrary("dxgi", .{});
         \\        app_mod.linkSystemLibrary("dwrite", .{});
         \\        app_mod.linkSystemLibrary("imm32", .{});
         \\        app_mod.linkSystemLibrary("comctl32", .{});
@@ -4151,6 +4153,23 @@ test "template strings are non-empty" {
     try std.testing.expect(build_zig.len > 0);
     try std.testing.expect(main_zig.len > 0);
     try std.testing.expect(runnerZig().len > 0);
+}
+
+test "web frontend build template links flip-model windows dependencies" {
+    const names = try TemplateNames.init(std.testing.allocator, "app");
+    defer names.deinit(std.testing.allocator);
+    const build_zig = try buildZig(std.testing.allocator, names, "..", .vite);
+    defer std.testing.allocator.free(build_zig);
+
+    const renderer_at = std.mem.indexOf(u8, build_zig, "src/platform/windows/gpu_surface_renderer.cpp") orelse return error.TestExpectedEqual;
+    const d2d_at = std.mem.indexOfPos(u8, build_zig, renderer_at, "app_mod.linkSystemLibrary(\"d2d1\", .{});") orelse return error.TestExpectedEqual;
+    const d3d11_at = std.mem.indexOfPos(u8, build_zig, renderer_at, "app_mod.linkSystemLibrary(\"d3d11\", .{});") orelse return error.TestExpectedEqual;
+    const dxgi_at = std.mem.indexOfPos(u8, build_zig, renderer_at, "app_mod.linkSystemLibrary(\"dxgi\", .{});") orelse return error.TestExpectedEqual;
+    const dwrite_at = std.mem.indexOfPos(u8, build_zig, renderer_at, "app_mod.linkSystemLibrary(\"dwrite\", .{});") orelse return error.TestExpectedEqual;
+
+    try std.testing.expect(d2d_at < d3d11_at);
+    try std.testing.expect(d3d11_at < dxgi_at);
+    try std.testing.expect(dxgi_at < dwrite_at);
 }
 
 test "template names are sanitized for generated metadata" {

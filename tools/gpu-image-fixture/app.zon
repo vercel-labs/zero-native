@@ -1,0 +1,27 @@
+.{
+    .id = "dev.native_sdk.gpu-image-fixture",
+    .name = "gpu-image-fixture",
+    .display_name = "GPU Image Fixture",
+    .description = "Resize-cost fixture: the runtime's full registered-image ceiling drawn on a hardware canvas.",
+    .version = "0.1.0",
+    .platforms = .{ "macos", "windows" },
+    .permissions = .{"view"},
+    .capabilities = .{ "native_views", "gpu_surfaces" },
+    .shell = .{
+        .windows = .{
+            .{
+                .label = "main",
+                .title = "GPU Image Fixture",
+                .width = 1024,
+                .height = 768,
+                .min_width = 420,
+                .min_height = 320,
+                .restore_state = false,
+                .restore_policy = "center_on_primary",
+                .views = .{
+                    .{ .label = "fixture-canvas", .kind = "gpu_surface", .fill = true, .role = "Image fixture canvas", .accessibility_label = "GPU image fixture", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                },
+            },
+        },
+    },
+}

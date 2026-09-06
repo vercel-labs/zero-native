@@ -1396,7 +1396,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "InvalidateRect(view.hwnd, &info.dirty_rects[index], FALSE)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "for (size_t y_index = y0; y_index < y1; ++y_index)" },
         .{ .path = "src/platform/windows/webview2_host.cpp", .pattern = "InvalidateRect(view.hwnd, partial_update ? &dirty_pixels : nullptr, FALSE)" },
-        .{ .path = "src/platform/windows/gpu_surface_renderer.cpp", .pattern = "D2D1_RENDER_TARGET_TYPE_HARDWARE" },
+        .{ .path = "src/platform/windows/gpu_surface_renderer.cpp", .pattern = "D3D11_CREATE_DEVICE_BGRA_SUPPORT" },
         .{ .path = "src/platform/windows/gpu_surface_renderer.cpp", .pattern = "retained_commands_ = std::move(next_retained)" },
         .{ .path = "src/platform/windows/gpu_surface_renderer.cpp", .pattern = "PushAxisAlignedClip(d2dRect(requested)" },
         .{ .path = "src/platform/windows/gpu_surface_renderer.cpp", .pattern = "const float expansion = effect.spread + blur" },
@@ -1858,6 +1858,12 @@ pub fn build(b: *std.Build) void {
         addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-service-feed-reader", "Run TypeScript service feed-reader example tests", "examples/service-feed-reader", .managed),
         addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-canvas-preview", "Run canvas preview example tests", "examples/canvas-preview", .managed),
         addExampleTestStep(b, host_cli_exe, native_examples_step, "test-example-capabilities", "Run capabilities example tests", "examples/capabilities", .owned),
+        // Not an example — a measurement fixture (tools/gpu-image-fixture),
+        // registered here because its whole job is to hold the runtime's
+        // registered-image ceiling and its tests are what catch that
+        // ceiling moving out from under it. `scripts/gate.sh fast` already
+        // maps a tools/ diff to this group, so this is where it belongs.
+        addExampleTestStep(b, host_cli_exe, native_examples_step, "test-tool-gpu-image-fixture", "Run GPU image fixture limit pins", "tools/gpu-image-fixture", .managed),
     };
     for (native_example_shard_steps) |shard_step| {
         native_examples_step.dependOn(shard_step);

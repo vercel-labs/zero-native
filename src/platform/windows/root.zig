@@ -2371,10 +2371,21 @@ test "windows packet renderer requires deterministic font and caption seams" {
         renderer_source,
         "layout2->SetFontFallback(renderer_->fontFallback())",
     ) != null);
+    // The caption sample reads one real backing pixel. It used to do that
+    // through GDI interop, which forced the whole backing surface to be
+    // D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_GDI_COMPATIBLE; a device-context
+    // target cannot carry that flag, so the read is a CPU-readable staging
+    // bitmap now. What this pins is the property that mattered — an actual
+    // pixel read, not the retained-command estimate.
     try std.testing.expect(std.mem.indexOf(
         u8,
         renderer_source,
-        "D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_GDI_COMPATIBLE",
+        "D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        renderer_source,
+        "readback_bitmap_->Map(D2D1_MAP_OPTIONS_READ, &mapped)",
     ) != null);
 
     const host_source = @embedFile("webview2_host.cpp");
@@ -2400,7 +2411,7 @@ test "windows packet renderer preserves text baselines and disjoint dirty region
     try std.testing.expect(std.mem.indexOf(
         u8,
         renderer_source,
-        "backing_target_->DrawGlyphRun(\n                    D2D1::Point2F(glyph.x, glyph.baseline)",
+        "ctx()->DrawGlyphRun(\n                    D2D1::Point2F(glyph.x, glyph.baseline)",
     ) != null);
 
     const draw_list_at = std.mem.indexOf(
@@ -2417,7 +2428,7 @@ test "windows packet renderer preserves text baselines and disjoint dirty region
     const segment_end_at = std.mem.indexOf(
         u8,
         draw_list,
-        "const HRESULT segment = backing_target_->EndDraw();",
+        "const HRESULT segment = ctx()->EndDraw();",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expect(blur_target_at < segment_end_at);
 
@@ -2437,6 +2448,94 @@ test "windows packet renderer preserves text baselines and disjoint dirty region
         host_source,
         "InvalidateRect(view.hwnd, &info.dirty_rects[index], FALSE)",
     ) != null);
+}
+
+test "windows flip-model presentation keeps its two correctness rules" {
+    const renderer_source = @embedFile("gpu_surface_renderer.cpp");
+
+    // Rule 1: FLIP_SEQUENTIAL, never FLIP_DISCARD. The renderer's
+    // incremental path repaints only damaged regions and copies the rest
+    // forward, so a back buffer whose undamaged content DXGI is free to
+    // discard would corrupt every patch frame — intermittently, and only
+    // on real hardware, which is the worst way to find out.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        renderer_source,
+        "desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;",
+    ) != null);
+    // The full constant, not the bare word: prose explaining why DISCARD is
+    // wrong is exactly what a comment should say, and matching on "FLIP_DISCARD"
+    // would fail on it. (The GDI pin this replaced had the mirror-image bug —
+    // it kept passing on a comment after the code was gone.)
+    try std.testing.expect(std.mem.indexOf(u8, renderer_source, "DXGI_SWAP_EFFECT_FLIP_DISCARD") == null);
+
+    // Rule 2: a partial copy refreshes THIS paint's damage plus the
+    // PREVIOUS paint's. With BufferCount = 2 the buffer being drawn was
+    // presented two frames ago, so copying only the current damage leaves
+    // a stale alternating image outside it. Both loops must be there.
+    const copy_at = std.mem.indexOf(
+        u8,
+        renderer_source,
+        "for (const RECT &region : damage) copy_region(region);",
+    ) orelse return error.TestExpectedEqual;
+    const carry_at = std.mem.indexOf(
+        u8,
+        renderer_source,
+        "for (const RECT &region : swap_last_damage_) copy_region(region);",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expect(copy_at < carry_at);
+
+    // ...and the dirty rects handed to Present1 are this paint's damage
+    // alone, because they describe the delta against the previously
+    // PRESENTED frame, which is a different set from the copied union.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        renderer_source,
+        "parameters.pDirtyRects = damage.data();",
+    ) != null);
+}
+
+test "windows swap buffers are allocated on a grid and cropped, never source-sized" {
+    const renderer_source = @embedFile("gpu_surface_renderer.cpp");
+
+    // The allocation is rounded up; the CLIENT size is what reaches the
+    // screen. Creating at the client size instead would put a
+    // ResizeBuffers back into every step of a resize drag, which is the
+    // whole cost this removes.
+    try std.testing.expect(std.mem.indexOf(u8, renderer_source, "desc.Width = swapAllocExtent(width);") != null);
+
+    // What makes the over-allocation legal is SCALING_NONE's CLIP, and
+    // nothing else. `IDXGISwapChain2::SetSourceSize` is the interface DXGI
+    // documents for this exact job and it must stay out: paired with
+    // SCALING_NONE it renders a surface whose buffer is much taller than
+    // its window — a 38 px header rounded up to a 128 px buffer — as a
+    // fragment at the top-left on a field of background colour, and it
+    // measured as worth nothing (0.428 ms against 0.426 ms per resize
+    // step). Match the call, not the type name, so the paragraph above
+    // explaining why it is absent does not satisfy its own pin.
+    try std.testing.expect(std.mem.indexOf(u8, renderer_source, "SetSourceSize(") == null);
+
+    // Damage is measured against the presented region, never the
+    // allocation: an over-allocated buffer is larger than the window, and
+    // a dirty rect outside the source region is not a valid dirty rect.
+    // A clamp against the bitmap's own pixel size would look right and be
+    // wrong by exactly the rounding.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        renderer_source,
+        "clamped.right = std::min<LONG>(static_cast<LONG>(source_width_), clamped.right);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        renderer_source,
+        "backing_pixels.width == source_width_ && backing_pixels.height == source_height_",
+    ) != null);
+
+    // SetBackgroundColor is documented to apply only to DXGI_SCALING_NONE
+    // in windowed mode, so the fill that keeps a growing drag from
+    // flashing depends on that scaling mode staying put.
+    try std.testing.expect(std.mem.indexOf(u8, renderer_source, "desc.Scaling = DXGI_SCALING_NONE;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renderer_source, "swap_chain_->SetBackgroundColor(&background)") != null);
 }
 
 test "windows packet renderer keeps square rectangle stroke joins" {

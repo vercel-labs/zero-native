@@ -304,6 +304,8 @@ fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.B
         app_mod.linkSystemLibrary("user32", .{});
         app_mod.linkSystemLibrary("gdi32", .{});
         app_mod.linkSystemLibrary("d2d1", .{});
+        app_mod.linkSystemLibrary("d3d11", .{});
+        app_mod.linkSystemLibrary("dxgi", .{});
         app_mod.linkSystemLibrary("dwrite", .{});
         app_mod.linkSystemLibrary("imm32", .{});
         app_mod.linkSystemLibrary("comctl32", .{});

@@ -1,12 +1,18 @@
 #include "gpu_surface_renderer.h"
 
 #include <d2d1.h>
+#include <d2d1_1.h>
+#include <d3d11.h>
 #include <dwrite_3.h>
+#include <dxgi1_2.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -26,6 +32,10 @@ constexpr uint8_t kPacketVersion = 5;
 constexpr size_t kRetainedCommandCap = 2048;
 constexpr size_t kDirtyRectCap = kWindowsGpuDirtyRectCap;
 constexpr uint32_t kMaxSurfacePixels = 8192;
+/* Beyond this many combined damage rectangles (this paint's plus the
+ * previous paint's), the per-rect clipped copies stop being cheaper than
+ * one full-surface pass and the paint falls back to copying everything. */
+constexpr size_t kSwapDirtyRectCap = 12;
 constexpr float kBezierCircle = 0.5522847498307936f;
 
 constexpr uint64_t canvasFontResourceId(uint64_t font_id) {
@@ -62,6 +72,29 @@ static float clamp01(float value) {
     return std::max(0.0f, std::min(1.0f, value));
 }
 
+/* True when `name` is set to anything other than "0" or the empty
+ * string. Diagnostic switches only -- nothing behavioral reads this. */
+static bool envFlagSet(const wchar_t *name) {
+    wchar_t value[8] = {};
+    const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+    if (length == 0) return false;
+    if (length >= std::size(value)) return true; /* long value, definitely not "0" */
+    return !(value[0] == L'\0' || (value[0] == L'0' && value[1] == L'\0'));
+}
+
+/* Small unsigned diagnostic knob; 0 when unset or unparseable. */
+static unsigned envCount(const wchar_t *name) {
+    wchar_t value[16] = {};
+    const DWORD length = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+    if (length == 0 || length >= std::size(value)) return 0;
+    unsigned parsed = 0;
+    for (const wchar_t *cursor = value; *cursor; ++cursor) {
+        if (*cursor < L'0' || *cursor > L'9') return 0;
+        parsed = parsed * 10 + static_cast<unsigned>(*cursor - L'0');
+    }
+    return parsed;
+}
+
 static uint64_t gpuClockNs() {
     static LARGE_INTEGER frequency = [] {
         LARGE_INTEGER value = {};
@@ -75,6 +108,112 @@ static uint64_t gpuClockNs() {
     const uint64_t ticks = static_cast<uint64_t>(counter.QuadPart);
     return (ticks / ticks_per_second) * 1000000000ULL +
         ((ticks % ticks_per_second) * 1000000000ULL) / ticks_per_second;
+}
+
+/* Env-gated presentation profiler.
+ *
+ * `NATIVE_SDK_GPU_PROFILE` names a log path; with it unset (every shipped
+ * run) the file is opened once per process as null, `gpuProfileActive()` is
+ * false, and each probe below costs one predicted branch and writes
+ * nothing. It exists because the Direct2D path's real
+ * costs are invisible from the outside: `ensureTargets` drops the whole
+ * per-surface texture cache on any dimension change, and only an app that
+ * actually holds textures pays for it. See `tools/gpu-image-fixture/`.
+ *
+ * Lines are key=value, one per event, in the shape the repo's automation
+ * snapshots already use:
+ *
+ *   present seq=12 pw=1200 ph=800 rebuild=1 flushed=16 targets_us=170 \
+ *           images_us=940 images_n=16 image_kib=16384 render_us=1210 \
+ *           decode_us=40 total_us=2400
+ *   paint   seq=12 pw=1200 ph=800 rects=1 blit_us=694
+ *
+ * `images_us` is CONTAINED IN `render_us` — the uploads happen inside the
+ * display-list walk, so a reducer that wants exclusive draw cost subtracts.
+ * `flushed` is how many cached bitmaps that step's target rebuild threw
+ * away, which is the count `images_n` then re-uploads. */
+class GpuProfileLog {
+public:
+    static GpuProfileLog &shared() {
+        static GpuProfileLog log;
+        return log;
+    }
+
+    bool active() const { return file_ != nullptr; }
+
+    void line(const char *format, ...) {
+        if (!file_) return;
+        char text[512];
+        va_list args;
+        va_start(args, format);
+        const int written = vsnprintf(text, sizeof(text), format, args);
+        va_end(args);
+        if (written <= 0) return;
+        fputs(text, file_);
+        /* Every line carries the monotonic clock, appended rather than
+         * prefixed so the record type still leads the line. Per-event
+         * durations cannot answer the question a resize actually poses —
+         * how far apart a surface's consecutive frames land — and that
+         * needs a wall clock, not a sequence number. Stamped at write
+         * time, i.e. immediately after the span the line reports. */
+        fprintf(file_, " t_us=%llu\n",
+            static_cast<unsigned long long>(gpuClockNs() / 1000ULL));
+        /* Buffered, not per-line flushed: a synchronous write inside a
+         * measured frame would show up in the very numbers being measured.
+         * 64 lines is well under a second of drag at any refresh rate, and
+         * the destructor closes the file on a clean exit. */
+        if (++pending_ >= 64) {
+            fflush(file_);
+            pending_ = 0;
+        }
+    }
+
+private:
+    GpuProfileLog() {
+        wchar_t path[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableW(L"NATIVE_SDK_GPU_PROFILE", path, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) return;
+        file_ = _wfopen(path, L"w");
+        if (!file_) return;
+        fputs("# native-sdk gpu surface profile: times in microseconds, images_us is inside render_us,"
+              " t_us is a monotonic stamp taken as the line is written\n", file_);
+    }
+
+    ~GpuProfileLog() {
+        if (!file_) return;
+        fflush(file_);
+        fclose(file_);
+    }
+
+    FILE *file_ = nullptr;
+    unsigned pending_ = 0;
+};
+
+static bool gpuProfileActive() {
+    return GpuProfileLog::shared().active();
+}
+
+/* Adds its scope's elapsed span to `sink`. The probed functions have
+ * several return paths each, and a hand-placed stop before every one of
+ * them is exactly the kind of thing that silently stops covering a path
+ * someone adds later. Constructed inactive it reads no clock at all. */
+class GpuProfileSpan {
+public:
+    GpuProfileSpan(bool active, uint64_t *sink)
+        : sink_(active ? sink : nullptr), begin_ns_(sink_ ? gpuClockNs() : 0) {}
+    ~GpuProfileSpan() {
+        if (sink_) *sink_ += gpuClockNs() - begin_ns_;
+    }
+    GpuProfileSpan(const GpuProfileSpan &) = delete;
+    GpuProfileSpan &operator=(const GpuProfileSpan &) = delete;
+
+private:
+    uint64_t *sink_;
+    uint64_t begin_ns_;
+};
+
+static uint64_t gpuProfileMicros(uint64_t nanoseconds) {
+    return (nanoseconds + 500) / 1000;
 }
 
 struct Point {
@@ -869,12 +1008,18 @@ public:
         releaseCom(memory_font_loader_);
         releaseCom(dwrite_factory5_);
         releaseCom(dwrite_factory_);
+        releaseDeviceStack();
         releaseCom(d2d_factory_);
     }
 
     bool initialize() {
         D2D1_FACTORY_OPTIONS options = {};
-        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, options, &d2d_factory_))) return false;
+        /* ID2D1Factory1, not ID2D1Factory: the derived interface is what
+         * owns `CreateDevice`, and it inherits every geometry and stroke
+         * entry point `d2dFactory()` already hands out, so the ~8 existing
+         * call sites are unchanged. */
+        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1),
+                &options, reinterpret_cast<void **>(&d2d_factory_))) || !d2d_factory_) return false;
         IUnknown *unknown = nullptr;
         if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), &unknown)) || !unknown) return false;
         dwrite_factory_ = static_cast<IDWriteFactory *>(unknown);
@@ -894,7 +1039,94 @@ public:
             fallback_result = fallback_builder->CreateFontFallback(&font_fallback_);
         }
         releaseCom(fallback_builder);
-        return SUCCEEDED(fallback_result) && font_fallback_;
+        if (FAILED(fallback_result) || !font_fallback_) return false;
+
+        /* The device stack is created eagerly here rather than lazily per
+         * surface: one D3D11 device backs every gpu_surface in the
+         * process, and a machine that cannot produce one at all should
+         * fail the renderer now, so the runtime takes its software pixel
+         * path from the first frame instead of discovering the problem
+         * mid-drag. */
+        return ensureDeviceStack();
+    }
+
+    /* Build D3D11 device -> IDXGIDevice -> ID2D1Device -> context.
+     *
+     * Idempotent, and safe to call again after `releaseDeviceStack()` --
+     * which is what device-removal recovery will need once presentation
+     * actually depends on this stack. */
+    bool ensureDeviceStack() {
+        if (d2d_context_) return true;
+        releaseDeviceStack();
+        if (!d2d_factory_) return false;
+
+        /* BGRA_SUPPORT is mandatory for D2D interop. SINGLETHREADED
+         * matches the D2D factory and the host's one-UI-thread model; it
+         * drops D3D's internal locking. */
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED;
+        static const D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+            D3D_FEATURE_LEVEL_9_3, D3D_FEATURE_LEVEL_9_2, D3D_FEATURE_LEVEL_9_1,
+        };
+        /* An RDP session, a disabled adapter, or a machine with no D3D11
+         * driver has no hardware device; WARP still composites correctly,
+         * just on the CPU. `NATIVE_SDK_GPU_FORCE_WARP` exercises that path
+         * on a machine that would otherwise never take it. */
+        const bool force_warp = envFlagSet(L"NATIVE_SDK_GPU_FORCE_WARP");
+        HRESULT result = force_warp ? E_FAIL : createD3DDevice(D3D_DRIVER_TYPE_HARDWARE, flags, levels);
+        driver_type_ = D3D_DRIVER_TYPE_HARDWARE;
+        if (FAILED(result)) {
+            result = createD3DDevice(D3D_DRIVER_TYPE_WARP, flags, levels);
+            driver_type_ = D3D_DRIVER_TYPE_WARP;
+        }
+        if (FAILED(result) || !d3d_device_) {
+            releaseDeviceStack();
+            return false;
+        }
+
+        IDXGIDevice *dxgi_device = nullptr;
+        result = d3d_device_->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
+        if (SUCCEEDED(result) && dxgi_device) {
+            /* The factory this surface's swap chain must come from is the
+             * one that owns this device's adapter -- an independently
+             * created DXGI factory produces a swap chain the device
+             * cannot present through. Resolve it here, once. */
+            IDXGIAdapter *adapter = nullptr;
+            if (SUCCEEDED(dxgi_device->GetAdapter(&adapter)) && adapter) {
+                DXGI_ADAPTER_DESC adapter_desc = {};
+                if (SUCCEEDED(adapter->GetDesc(&adapter_desc))) {
+                    WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1,
+                        adapter_name_, static_cast<int>(sizeof(adapter_name_)), nullptr, nullptr);
+                }
+                adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&dxgi_factory_));
+            }
+            releaseCom(adapter);
+            result = d2d_factory_->CreateDevice(dxgi_device, &d2d_device_);
+        }
+        releaseCom(dxgi_device);
+        if (SUCCEEDED(result) && d2d_device_) {
+            result = d2d_device_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2d_context_);
+        }
+        if (FAILED(result) || !d2d_context_ || !dxgi_factory_) {
+            releaseDeviceStack();
+            return false;
+        }
+        device_generation_ += 1;
+        if (gpuProfileActive()) {
+            GpuProfileLog::shared().line("device driver=%s level=0x%04x generation=%llu adapter=\"%s\"",
+                driver_type_ == D3D_DRIVER_TYPE_WARP ? "warp" : "hardware",
+                static_cast<unsigned>(feature_level_),
+                static_cast<unsigned long long>(device_generation_), adapter_name_);
+        }
+        return true;
+    }
+
+    void releaseDeviceStack() {
+        releaseCom(d2d_context_);
+        releaseCom(d2d_device_);
+        releaseCom(dxgi_factory_);
+        releaseCom(d3d_device_);
     }
 
     std::shared_ptr<WindowsGpuSurface> createSurface(HWND hwnd) override;
@@ -977,7 +1209,50 @@ public:
         return true;
     }
 
-    ID2D1Factory *d2dFactory() const { return d2d_factory_; }
+    /* Bumped every time the device stack is (re)built. Surfaces stamp
+     * the generation they built against and compare, which is how a
+     * device loss reaches them without the renderer having to keep a
+     * registry of live surfaces. */
+    uint64_t deviceGeneration() const { return device_generation_; }
+
+    /* HRESULTs that mean "this device is gone, rebuild everything", as
+     * opposed to D2DERR_RECREATE_TARGET, which means only the target
+     * went and the device is still good. */
+    static bool deviceLost(HRESULT result) {
+        return result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
+            result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR ||
+            result == D2DERR_RECREATE_TARGET;
+    }
+
+    /* Tear the whole stack down and build a new one. Surfaces discover
+     * this through the generation counter and drop their own resources
+     * -- every backing bitmap, swap chain, and cached texture belongs to
+     * the device that just died. Returns false if the machine cannot
+     * produce a device at all now, in which case surfaces stay dark and
+     * the runtime keeps taking its software path. */
+    bool recoverDeviceStack() {
+        HRESULT reason = S_OK;
+        if (d3d_device_) reason = d3d_device_->GetDeviceRemovedReason();
+        releaseDeviceStack();
+        const bool recovered = ensureDeviceStack();
+        if (gpuProfileActive()) {
+            GpuProfileLog::shared().line("device-lost reason=0x%08x recovered=%d generation=%llu",
+                static_cast<unsigned>(reason), recovered ? 1 : 0,
+                static_cast<unsigned long long>(device_generation_));
+        }
+        return recovered;
+    }
+
+    ID2D1Factory1 *d2dFactory() const { return d2d_factory_; }
+    ID3D11Device *d3dDevice() const { return d3d_device_; }
+    ID2D1Device *d2dDevice() const { return d2d_device_; }
+    /* One context shared by every surface. Direct2D device contexts are
+     * cheap to retarget (`SetTarget`) and expensive to multiply -- each
+     * one carries its own command buffer against the same device. */
+    ID2D1DeviceContext *d2dContext() const { return d2d_context_; }
+    /* The adapter's own factory (never an independently created one --
+     * a swap chain from a foreign factory cannot present this device). */
+    IDXGIFactory2 *dxgiFactory() const { return dxgi_factory_; }
     IDWriteFactory *dwriteFactory() const { return dwrite_factory_; }
     IDWriteFontFallback *fontFallback() const { return font_fallback_; }
 
@@ -992,7 +1267,29 @@ public:
     }
 
 private:
-    ID2D1Factory *d2d_factory_ = nullptr;
+    HRESULT createD3DDevice(D3D_DRIVER_TYPE driver, UINT flags, const D3D_FEATURE_LEVEL (&levels)[7]) {
+        HRESULT result = D3D11CreateDevice(nullptr, driver, nullptr, flags, levels,
+            static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION, &d3d_device_, &feature_level_, nullptr);
+        /* A driver older than the 11_1 runtime rejects the whole list
+         * rather than negotiating down, so retry without that first
+         * entry. This is the documented shape of the call. */
+        if (result == E_INVALIDARG) {
+            result = D3D11CreateDevice(nullptr, driver, nullptr, flags, levels + 1,
+                static_cast<UINT>(std::size(levels)) - 1, D3D11_SDK_VERSION, &d3d_device_, &feature_level_, nullptr);
+        }
+        if (FAILED(result)) releaseCom(d3d_device_);
+        return result;
+    }
+
+    ID2D1Factory1 *d2d_factory_ = nullptr;
+    ID3D11Device *d3d_device_ = nullptr;
+    IDXGIFactory2 *dxgi_factory_ = nullptr;
+    ID2D1Device *d2d_device_ = nullptr;
+    ID2D1DeviceContext *d2d_context_ = nullptr;
+    uint64_t device_generation_ = 0;
+    D3D_DRIVER_TYPE driver_type_ = D3D_DRIVER_TYPE_UNKNOWN;
+    D3D_FEATURE_LEVEL feature_level_ = static_cast<D3D_FEATURE_LEVEL>(0);
+    char adapter_name_[128] = {};
     IDWriteFactory *dwrite_factory_ = nullptr;
     IDWriteFactory5 *dwrite_factory5_ = nullptr;
     IDWriteInMemoryFontFileLoader *memory_font_loader_ = nullptr;
@@ -1124,6 +1421,8 @@ static bool makePathGeometry(ID2D1Factory *factory, const Shape &shape, bool fil
 class GpuSurfaceImpl final : public WindowsGpuSurface {
 public:
     GpuSurfaceImpl(std::shared_ptr<GpuRendererImpl> renderer, HWND hwnd) : renderer_(std::move(renderer)), hwnd_(hwnd) {
+        static unsigned next_surface_id = 0;
+        surface_id_ = ++next_surface_id;
         D2D1_STROKE_STYLE_PROPERTIES style = D2D1::StrokeStyleProperties();
         style.startCap = D2D1_CAP_STYLE_FLAT;
         style.endCap = D2D1_CAP_STYLE_FLAT;
@@ -1153,6 +1452,14 @@ public:
     uint32_t representativeColorAt(double logical_x, double logical_y) const override;
 
 private:
+    /* The real bodies. `present`/`paint` are thin wrappers that exist only
+     * so the `NATIVE_SDK_GPU_PROFILE` accumulators are reset and emitted on
+     * exactly one path each — these two have a dozen refusal returns
+     * between them, and per-return bookkeeping would rot on the first one
+     * someone adds. */
+    int presentPacket(const WindowsGpuPacketPresent &present, WindowsGpuPresentInfo *info);
+    bool paintRects(const RECT *paint_rects, size_t paint_rect_count);
+
     struct CachedBitmap {
         uint64_t serial = 0;
         ID2D1Bitmap *bitmap = nullptr;
@@ -1170,12 +1477,67 @@ private:
         image_bitmaps_.erase(found);
     }
 
+    /* One device context, shared by every surface on the renderer. It
+     * carries no per-surface state of its own: each render and each paint
+     * sets its target and DPI before drawing (`beginOn`). */
+    ID2D1DeviceContext *ctx() const { return renderer_->d2dContext(); }
+
+    /* Point the shared context at one of this surface's bitmaps, with
+     * this surface's DPI, and open a draw. Every BeginDraw in this file
+     * goes through here so the target can never be whatever the previous
+     * surface left bound. */
+    void beginOn(ID2D1Bitmap1 *target) {
+        ctx()->SetTarget(target);
+        ctx()->SetDpi(static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
+        ctx()->BeginDraw();
+        ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
+    }
+
+    /* Close the draw and unbind. Unbinding matters: a bound target holds
+     * a reference, and `ResizeBuffers` fails while any reference to a
+     * back buffer is outstanding. */
+    HRESULT endOn() {
+        const HRESULT result = ctx()->EndDraw();
+        ctx()->SetTarget(nullptr);
+        return result;
+    }
+
+    /* Adopt the renderer's current device generation, dropping every
+     * resource built against the previous one. Called before any frame
+     * work: a surface whose device was removed holds a backing bitmap, a
+     * swap chain, and a texture cache that all belong to a dead device,
+     * and none of them can be reused or repaired -- only released.
+     *
+     * Returns false when there is no usable device at all, which leaves
+     * the surface contentless and the runtime on its software path. */
+    bool syncDevice() {
+        const uint64_t generation = renderer_->deviceGeneration();
+        if (generation != device_generation_) {
+            releaseDeviceResources(true);
+            device_generation_ = generation;
+        }
+        return renderer_->d2dContext() != nullptr;
+    }
+
+    /* One exit for every lost-device HRESULT. Rebuilds the shared stack
+     * (which bumps the generation, so sibling surfaces drop theirs on
+     * their next frame) and clears this surface. The caller returns
+     * false, which makes the host set `gpu_force_full_repaint_pending`
+     * and ask the runtime for a full packet. */
+    void handleDeviceLoss(HRESULT result) {
+        if (GpuRendererImpl::deviceLost(result) && result != D2DERR_RECREATE_TARGET) {
+            renderer_->recoverDeviceStack();
+            device_generation_ = renderer_->deviceGeneration();
+        }
+        releaseDeviceResources(true);
+    }
+
     void releaseDeviceResources(bool drop_retained) {
         releaseImageBitmaps();
         releaseCom(blur_snapshot_);
+        releaseCom(readback_bitmap_);
         releaseCom(backing_bitmap_);
-        releaseCom(backing_target_);
-        releaseCom(window_target_);
+        releaseSwapChain();
         content_valid_ = false;
         if (drop_retained) {
             retained_valid_ = false;
@@ -1184,32 +1546,248 @@ private:
         }
     }
 
-    bool ensureWindowTarget() {
-        if (window_target_) return true;
-        RECT client = {};
-        if (!hwnd_ || !GetClientRect(hwnd_, &client)) return false;
-        const UINT width = static_cast<UINT>(std::max<LONG>(1, client.right - client.left));
-        const UINT height = static_cast<UINT>(std::max<LONG>(1, client.bottom - client.top));
-        const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_HARDWARE,
+    void releaseSwapChain() {
+        /* Order matters: the D2D bitmap holds the back buffer, and the
+         * swap chain cannot be released cleanly underneath it. */
+        if (ctx()) ctx()->SetTarget(nullptr);
+        releaseCom(swap_bitmap_);
+        releaseCom(swap_chain_);
+        swap_width_ = 0;
+        swap_height_ = 0;
+        source_width_ = 0;
+        source_height_ = 0;
+        swap_bitmap_scale_ = 0;
+        swap_background_applied_ = false;
+        swap_last_damage_.clear();
+        swap_history_valid_ = false;
+    }
+
+    /* Buffers are allocated on a grid, not at the client size.
+     *
+     * A drag delivers a new client size on every mouse step, and
+     * `ResizeBuffers` on each of them is the most expensive single thing
+     * in a resize frame: it frees and reallocates both back buffers, tears
+     * down and rebuilds the D2D view of buffer 0, and re-associates the
+     * chain with the window. Rounding the ALLOCATION up to a grid turns
+     * that into once per granularity step of travel; every client size in
+     * between is free, because SCALING_NONE simply crops the buffer to the
+     * window (see `ensureSwapChain`).
+     *
+     * The grid costs at most one granularity step of over-allocation per
+     * axis. At 128 px and 4 bytes per pixel that is well under a megabyte
+     * on a panel-sized surface, and an editor with a dozen of them still
+     * pays less than one 4K frame's worth in total. */
+    static constexpr UINT kSwapAllocGranularityDefault = 128;
+
+    /* `NATIVE_SDK_GPU_SWAP_GRANULARITY=<n>` overrides it, and `1` turns
+     * the grid off entirely -- allocate exactly the client size, which is
+     * the pre-grid behaviour. This earned its place: the first version of
+     * this change also called `SetSourceSize`, which broke every surface
+     * whose window is much shorter than its rounded-up buffer, and a
+     * switch that separates over-allocating from what is done with the
+     * over-allocation is what identified which half was at fault. Keep it
+     * for the next such question, and as the escape hatch if a driver
+     * disagrees about SCALING_NONE. */
+    static UINT swapAllocGranularity() {
+        static const UINT granularity = [] {
+            const unsigned configured = envCount(L"NATIVE_SDK_GPU_SWAP_GRANULARITY");
+            return configured > 0 ? static_cast<UINT>(configured) : kSwapAllocGranularityDefault;
+        }();
+        return granularity;
+    }
+
+    static UINT swapAllocExtent(UINT extent) {
+        const UINT granularity = swapAllocGranularity();
+        const UINT rounded = ((extent + granularity - 1) / granularity) * granularity;
+        return rounded > 0 ? rounded : granularity;
+    }
+
+    /* FLIP_SEQUENTIAL, not FLIP_DISCARD: the renderer's incremental path
+     * repaints only damaged regions, so undamaged pixels must survive
+     * into the next frame. DISCARD would silently corrupt patch frames.
+     *
+     * SCALING_NONE is what makes an over-allocated buffer present
+     * correctly at all. It aligns the buffer's top-left with the window's
+     * and CLIPS rather than stretches, so a buffer larger than the window
+     * shows exactly the window-sized top-left crop -- which is where this
+     * renderer draws. It is also the one scaling mode `SetBackgroundColor`
+     * applies to.
+     *
+     * `IDXGISwapChain2::SetSourceSize` is the interface DXGI documents for
+     * "an effective resize without calling the more-expensive
+     * ResizeBuffers", and it is deliberately NOT used here. Paired with
+     * SCALING_NONE it renders wrong: a surface whose buffer is much taller
+     * than its window (a 38 px header rounded up to a 128 px buffer) comes
+     * out as a small fragment at the top-left on a field of background
+     * colour. Measured on a real app, it is also worth nothing -- 0.428 ms
+     * against 0.426 ms per resize step with it removed, which is noise.
+     * The allocation grid below is doing all of the work; the source
+     * region was only ever going to tell DWM something the clip already
+     * says. */
+    bool ensureSwapChain(UINT width, UINT height) {
+        if (swap_chain_) {
+            const bool too_small = width > swap_width_ || height > swap_height_;
+            /* Reclaim only on a big shrink. Reallocating the moment the
+             * client drops below the current grid cell would put the
+             * ResizeBuffers back into every step of a shrinking drag,
+             * which is the cost this whole scheme exists to avoid. */
+            const bool wasteful = swap_width_ >= 2 * swapAllocExtent(width) ||
+                swap_height_ >= 2 * swapAllocExtent(height);
+            if ((too_small || wasteful) && !resizeSwapChain(width, height)) return false;
+            if (!ensureSwapBitmap()) return false;
+            return trackPresentedExtent(width, height);
+        }
+        if (!hwnd_ || !renderer_->dxgiFactory() || !renderer_->d3dDevice()) return false;
+
+        DXGI_SWAP_CHAIN_DESC1 desc = {};
+        desc.Width = swapAllocExtent(width);
+        desc.Height = swapAllocExtent(height);
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.Scaling = DXGI_SCALING_NONE;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        /* Top-level layered windows are refused long before this
+         * renderer, so the surface is always opaque. */
+        desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        if (FAILED(renderer_->dxgiFactory()->CreateSwapChainForHwnd(
+                renderer_->d3dDevice(), hwnd_, &desc, nullptr, nullptr, &swap_chain_)) || !swap_chain_) {
+            releaseSwapChain();
+            return false;
+        }
+        /* The host owns Alt+Enter; DXGI's own handler would fight it. */
+        renderer_->dxgiFactory()->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+        swap_width_ = desc.Width;
+        swap_height_ = desc.Height;
+        swap_alloc_count_ += 1;
+        if (!ensureSwapBitmap()) return false;
+        return trackPresentedExtent(width, height);
+    }
+
+    bool resizeSwapChain(UINT width, UINT height) {
+        /* Every reference to the back buffer must be gone first. */
+        ctx()->SetTarget(nullptr);
+        releaseCom(swap_bitmap_);
+        swap_bitmap_scale_ = 0;
+        const UINT alloc_width = swapAllocExtent(width);
+        const UINT alloc_height = swapAllocExtent(height);
+        if (FAILED(swap_chain_->ResizeBuffers(0, alloc_width, alloc_height, DXGI_FORMAT_UNKNOWN, 0))) {
+            releaseSwapChain();
+            return false;
+        }
+        swap_width_ = alloc_width;
+        swap_height_ = alloc_height;
+        swap_alloc_count_ += 1;
+        /* Resized buffers hold undefined pixels, so the next paint owes a
+         * full copy before any partial one can be correct. */
+        swap_last_damage_.clear();
+        swap_history_valid_ = false;
+        return true;
+    }
+
+    /* The window-sized top-left crop of the buffers that SCALING_NONE
+     * actually puts on screen. Nothing is called here -- DXGI derives the
+     * crop from the window itself -- but every other part of this file
+     * needs the number: it is what damage clamps to, what `exact`
+     * compares against, and it is NOT the buffers' pixel size once the
+     * allocation is rounded up.
+     *
+     * Recording it invalidates the damage history. Growing the crop
+     * exposes buffer pixels this surface has never drawn, so the next copy
+     * owes the whole thing -- one full copy per size change, which is what
+     * a resize step costs anyway, minus the reallocation. */
+    bool trackPresentedExtent(UINT width, UINT height) {
+        if (width == source_width_ && height == source_height_) return true;
+        source_width_ = width;
+        source_height_ = height;
+        swap_last_damage_.clear();
+        swap_history_valid_ = false;
+        return true;
+    }
+
+    bool ensureSwapBitmap() {
+        /* A D2D bitmap's DPI is fixed at creation, so a monitor-scale
+         * change has to rebuild the view even when the buffers did not
+         * move. Every other caller is already gated on the buffers
+         * changing, which is why this is the only place that checks. */
+        if (swap_bitmap_ && swap_bitmap_scale_ == scale_) return true;
+        if (swap_bitmap_) {
+            ctx()->SetTarget(nullptr);
+            releaseCom(swap_bitmap_);
+        }
+        IDXGISurface *surface = nullptr;
+        if (FAILED(swap_chain_->GetBuffer(0, IID_PPV_ARGS(&surface))) || !surface) {
+            releaseCom(surface);
+            return false;
+        }
+        const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-            static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_),
-            D2D1_RENDER_TARGET_USAGE_NONE,
-            D2D1_FEATURE_LEVEL_DEFAULT);
-        const D2D1_HWND_RENDER_TARGET_PROPERTIES hwnd_properties = D2D1::HwndRenderTargetProperties(
-            hwnd_, D2D1::SizeU(width, height), D2D1_PRESENT_OPTIONS_NONE);
-        return SUCCEEDED(renderer_->d2dFactory()->CreateHwndRenderTarget(properties, hwnd_properties, &window_target_));
+            static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
+        const HRESULT result = ctx()->CreateBitmapFromDxgiSurface(surface, &properties, &swap_bitmap_);
+        releaseCom(surface);
+        if (FAILED(result) || !swap_bitmap_) return false;
+        swap_bitmap_scale_ = scale_;
+        return true;
+    }
+
+    /* The colour DXGI fills the window with wherever the presented region
+     * does not reach it. That gap is not hypothetical: DWM keeps showing
+     * the last present until the next one lands, so every window-expanding
+     * drag step exposes a band for one frame. Left unset the fill is not
+     * the app's -- it reads as a white flash along the growing edge, and
+     * an app-adopted media surface that only repaints on a new video frame
+     * can hold it far longer than one frame.
+     *
+     * The app's own clear colour is the right value by construction: it is
+     * the colour that band is about to be painted, so filling it early is
+     * indistinguishable from having drawn it. SCALING_NONE is a
+     * precondition of the call (see the swap-chain description), and with
+     * ALPHA_MODE_IGNORE the alpha channel is ignored. */
+    void applyBackgroundColor() {
+        if (!swap_chain_) return;
+        if (swap_background_applied_ &&
+            swap_background_.r == clear_color_.r &&
+            swap_background_.g == clear_color_.g &&
+            swap_background_.b == clear_color_.b) return;
+        const DXGI_RGBA background = {
+            clamp01(clear_color_.r), clamp01(clear_color_.g), clamp01(clear_color_.b), 1.0f};
+        /* Refused on the Windows 7 platform update (E_NOTIMPL) and on any
+         * scaling mode but NONE. Nothing downstream depends on it, so a
+         * refusal only costs the flash it was there to prevent. */
+        swap_background_applied_ = SUCCEEDED(swap_chain_->SetBackgroundColor(&background));
+        if (swap_background_applied_) swap_background_ = clear_color_;
     }
 
     bool ensureTargets(double surface_width, double surface_height, double scale, uint32_t pixel_width, uint32_t pixel_height) {
-        const bool dimensions_changed = backing_target_ &&
+        const bool profiling = gpuProfileActive();
+        const GpuProfileSpan profile_span(profiling, &profile_targets_ns_);
+        const bool dimensions_changed = backing_bitmap_ &&
             (pixel_width_ != pixel_width || pixel_height_ != pixel_height || scale_ != scale ||
              surface_width_ != surface_width || surface_height_ != surface_height);
+        if (profiling) {
+            profile_target_rebuild_ = dimensions_changed;
+            profile_flushed_bitmaps_ = dimensions_changed ? image_bitmaps_.size() : 0;
+        }
         if (dimensions_changed) {
-            releaseImageBitmaps();
+            /* The image cache is NOT dropped here any more, and that is
+             * the whole point of the migration.
+             *
+             * Under the blt model these bitmaps belonged to the backing
+             * render target, which this branch recreated, so every one of
+             * them had to go and be re-uploaded from CPU memory on the
+             * next frame -- 1.5 ms per resize step at the runtime's
+             * 16 MiB registry ceiling. They are created from the
+             * `ID2D1Device` now, so they outlive any surface resize and
+             * `ensureImageBitmap` keeps hitting its cache mid-drag.
+             *
+             * The two surfaces that genuinely are size-shaped still go:
+             * the backing bitmap (a D2D bitmap's pixel size and DPI are
+             * fixed at creation) and the blur snapshot (allocated at
+             * surface size). */
             releaseCom(blur_snapshot_);
             releaseCom(backing_bitmap_);
-            releaseCom(backing_target_);
             content_valid_ = false;
         }
         scale_ = scale;
@@ -1218,27 +1796,24 @@ private:
         pixel_width_ = pixel_width;
         pixel_height_ = pixel_height;
 
-        if (window_target_) window_target_->SetDpi(static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
-        if (!ensureWindowTarget()) return false;
-        if (backing_target_) return true;
+        if (!renderer_->d2dContext()) return false;
+        if (backing_bitmap_) return true;
 
-        const D2D1_SIZE_F desired = D2D1::SizeF(static_cast<FLOAT>(surface_width_), static_cast<FLOAT>(surface_height_));
-        const D2D1_SIZE_U pixels = D2D1::SizeU(pixel_width_, pixel_height_);
-        const D2D1_PIXEL_FORMAT format = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
-        HRESULT result = window_target_->CreateCompatibleRenderTarget(
-            &desired, &pixels, &format, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_GDI_COMPATIBLE, &backing_target_);
-        if (SUCCEEDED(result) && backing_target_) {
-            backing_target_->SetDpi(static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
-        }
-        return SUCCEEDED(result) && backing_target_;
+        const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
+        const HRESULT result = ctx()->CreateBitmap(
+            D2D1::SizeU(pixel_width_, pixel_height_), nullptr, 0, properties, &backing_bitmap_);
+        return SUCCEEDED(result) && backing_bitmap_;
     }
 
     bool makeBrush(const Paint &paint, float opacity, ID2D1Brush **brush) {
-        if (!brush || !backing_target_) return false;
+        if (!brush || !backing_bitmap_) return false;
         *brush = nullptr;
         if (paint.kind == Paint::Kind::color) {
             ID2D1SolidColorBrush *solid = nullptr;
-            if (FAILED(backing_target_->CreateSolidColorBrush(d2dColor(paint.color, opacity), &solid))) return false;
+            if (FAILED(ctx()->CreateSolidColorBrush(d2dColor(paint.color, opacity), &solid))) return false;
             *brush = solid;
             return true;
         }
@@ -1253,11 +1828,11 @@ private:
         }
         ID2D1GradientStopCollection *collection = nullptr;
         ID2D1LinearGradientBrush *gradient = nullptr;
-        HRESULT result = backing_target_->CreateGradientStopCollection(
+        HRESULT result = ctx()->CreateGradientStopCollection(
             stops.data(), static_cast<UINT32>(stops.size()), D2D1_GAMMA_2_2,
             D2D1_EXTEND_MODE_CLAMP, &collection);
         if (SUCCEEDED(result)) {
-            result = backing_target_->CreateLinearGradientBrush(
+            result = ctx()->CreateLinearGradientBrush(
                 D2D1::LinearGradientBrushProperties(
                     D2D1::Point2F(paint.start.x, paint.start.y),
                     D2D1::Point2F(paint.end.x, paint.end.y)), collection, &gradient);
@@ -1308,7 +1883,7 @@ private:
                 releaseCom(brush);
                 return false;
             }
-            backing_target_->DrawLine(
+            ctx()->DrawLine(
                 D2D1::Point2F(command.shape.from.x, command.shape.from.y),
                 D2D1::Point2F(command.shape.to.x, command.shape.to.y),
                 brush, stroke_width, command.cap == 1 ? round_stroke_ : butt_stroke_);
@@ -1324,9 +1899,9 @@ private:
             ID2D1StrokeStyle *stroke_style = command.shape.kind == Shape::Kind::stroke_rect
                 ? rect_stroke_
                 : (command.cap == 1 ? round_stroke_ : butt_stroke_);
-            backing_target_->DrawGeometry(geometry, brush, stroke_width, stroke_style);
+            ctx()->DrawGeometry(geometry, brush, stroke_width, stroke_style);
         } else {
-            backing_target_->FillGeometry(geometry, brush);
+            ctx()->FillGeometry(geometry, brush);
         }
         releaseCom(geometry);
         releaseCom(brush);
@@ -1334,7 +1909,7 @@ private:
     }
 
     bool ensureImageBitmap(uint64_t id, ID2D1Bitmap **bitmap) {
-        if (!bitmap || !backing_target_) return false;
+        if (!bitmap || !backing_bitmap_) return false;
         *bitmap = nullptr;
         auto resource_found = image_cache_.find(id);
         if (resource_found == image_cache_.end() || !resource_found->second) return true;
@@ -1348,9 +1923,19 @@ private:
         cached.serial = 0;
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
-        HRESULT result = backing_target_->CreateBitmap(
+        /* The measured cost this migration is about: a cache miss here is a
+         * full CPU->GPU texture upload, and a resize step misses on every
+         * live image because `ensureTargets` dropped the whole map. */
+        const bool profiling = gpuProfileActive();
+        const uint64_t upload_begin_ns = profiling ? gpuClockNs() : 0;
+        HRESULT result = ctx()->CreateBitmap(
             D2D1::SizeU(resource->width, resource->height), resource->bgra.data(),
             resource->width * 4, properties, &cached.bitmap);
+        if (profiling) {
+            profile_image_ns_ += gpuClockNs() - upload_begin_ns;
+            profile_image_uploads_ += 1;
+            profile_image_bytes_ += resource->bgra.size();
+        }
         if (FAILED(result) || !cached.bitmap) return false;
         cached.serial = resource->serial;
         *bitmap = cached.bitmap;
@@ -1397,7 +1982,7 @@ private:
             std::max(command.image.radius.bottom_right, command.image.radius.bottom_left));
         if (max_radius > 0) {
             if (!makeRoundedGeometry(renderer_->d2dFactory(), requested, command.image.radius, &mask) ||
-                FAILED(backing_target_->CreateLayer(nullptr, &layer))) {
+                FAILED(ctx()->CreateLayer(nullptr, &layer))) {
                 releaseCom(mask);
                 releaseCom(layer);
                 return false;
@@ -1407,19 +1992,19 @@ private:
             parameters.geometricMask = mask;
             parameters.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
             parameters.opacity = 1.0f;
-            backing_target_->PushLayer(parameters, layer);
+            ctx()->PushLayer(parameters, layer);
         } else if (command.image.fit == 2) {
             /* Cover expands one destination axis past the requested frame.
              * A zero-radius image still has a rectangular destination mask;
              * without this clip the expanded bitmap paints over siblings. */
-            backing_target_->PushAxisAlignedClip(d2dRect(requested), D2D1_ANTIALIAS_MODE_ALIASED);
+            ctx()->PushAxisAlignedClip(d2dRect(requested), D2D1_ANTIALIAS_MODE_ALIASED);
         }
-        backing_target_->DrawBitmap(bitmap, d2dRect(destination),
+        ctx()->DrawBitmap(bitmap, d2dRect(destination),
             clamp01(command.opacity * command.image.opacity),
             command.image.sampling == 0 ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             d2dRect(source));
-        if (layer) backing_target_->PopLayer();
-        else if (command.image.fit == 2) backing_target_->PopAxisAlignedClip();
+        if (layer) ctx()->PopLayer();
+        else if (command.image.fit == 2) ctx()->PopAxisAlignedClip();
         releaseCom(layer);
         releaseCom(mask);
         return true;
@@ -1559,7 +2144,7 @@ private:
         IDWriteTextFormat *format = nullptr;
         ID2D1SolidColorBrush *brush = nullptr;
         if (!createTextFormat(text, &format) ||
-            FAILED(backing_target_->CreateSolidColorBrush(d2dColor(text.color, command.opacity), &brush))) {
+            FAILED(ctx()->CreateSolidColorBrush(d2dColor(text.color, command.opacity), &brush))) {
             releaseCom(brush);
             releaseCom(format);
             return false;
@@ -1576,7 +2161,7 @@ private:
             UINT32 actual = 0;
             if (SUCCEEDED(result)) result = layout->GetLineMetrics(&metrics, 1, &actual);
             if (SUCCEEDED(result) && actual == 1) {
-                backing_target_->DrawTextLayout(D2D1::Point2F(x, baseline - metrics.baseline), layout, brush,
+                ctx()->DrawTextLayout(D2D1::Point2F(x, baseline - metrics.baseline), layout, brush,
                     D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             }
             releaseCom(layout);
@@ -1608,7 +2193,7 @@ private:
                 glyph_run.glyphIndices = &glyph_index;
                 glyph_run.glyphAdvances = &glyph_advance;
                 glyph_run.glyphOffsets = &glyph_offset;
-                backing_target_->DrawGlyphRun(
+                ctx()->DrawGlyphRun(
                     D2D1::Point2F(glyph.x, glyph.baseline), &glyph_run, brush, DWRITE_MEASURING_MODE_NATURAL);
             }
             if (result) {
@@ -1657,7 +2242,7 @@ private:
                 IDWriteTextLayout *layout = nullptr;
                 result = createTextLayout(value, format, width, height, &layout);
                 if (result) {
-                    backing_target_->DrawTextLayout(
+                    ctx()->DrawTextLayout(
                         D2D1::Point2F(text.origin.x, text.origin.y - text.size), layout, brush,
                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
                 }
@@ -1697,12 +2282,12 @@ private:
             Color layer_color = effect.color;
             layer_color.a *= static_cast<float>(index + 1) / weight_sum;
             if (!makeRoundedGeometry(renderer_->d2dFactory(), rect, radius, &geometry) ||
-                FAILED(backing_target_->CreateSolidColorBrush(d2dColor(layer_color, command.opacity), &brush))) {
+                FAILED(ctx()->CreateSolidColorBrush(d2dColor(layer_color, command.opacity), &brush))) {
                 releaseCom(brush);
                 releaseCom(geometry);
                 return false;
             }
-            backing_target_->FillGeometry(geometry, brush);
+            ctx()->FillGeometry(geometry, brush);
             releaseCom(brush);
             releaseCom(geometry);
         }
@@ -1711,11 +2296,11 @@ private:
 
     bool ensureBlurSnapshot() {
         if (blur_snapshot_) return true;
-        if (!backing_target_ || pixel_width_ == 0 || pixel_height_ == 0) return false;
+        if (!backing_bitmap_ || pixel_width_ == 0 || pixel_height_ == 0) return false;
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
             static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
-        return SUCCEEDED(backing_target_->CreateBitmap(
+        return SUCCEEDED(ctx()->CreateBitmap(
             D2D1::SizeU(pixel_width_, pixel_height_), nullptr, 0, properties, &blur_snapshot_)) && blur_snapshot_;
     }
 
@@ -1736,13 +2321,15 @@ private:
 
     bool resumeAndDrawBlur(const Command &command, Rect target) {
         auto resume = [&] {
-            backing_target_->BeginDraw();
-            backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
+            ctx()->BeginDraw();
+            ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
         };
 
-        releaseCom(backing_bitmap_);
-        if (FAILED(backing_target_->GetBitmap(&backing_bitmap_)) || !backing_bitmap_ ||
-            !ensureBlurSnapshot() || FAILED(blur_snapshot_->CopyFromBitmap(nullptr, backing_bitmap_, nullptr))) {
+        /* The backing surface is now the context's bound target rather
+         * than something to fetch back out of it, so the backdrop copy
+         * reads it directly. */
+        if (!backing_bitmap_ || !ensureBlurSnapshot() ||
+            FAILED(blur_snapshot_->CopyFromBitmap(nullptr, backing_bitmap_, nullptr))) {
             resume();
             return false;
         }
@@ -1763,7 +2350,7 @@ private:
             DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED);
         ID2D1BitmapRenderTarget *temporary = nullptr;
         ID2D1Bitmap *blurred = nullptr;
-        HRESULT result = backing_target_->CreateCompatibleRenderTarget(
+        HRESULT result = ctx()->CreateCompatibleRenderTarget(
             &desired, &pixels, &format, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, &temporary);
         if (FAILED(result) || !temporary) {
             releaseCom(temporary);
@@ -1813,10 +2400,10 @@ private:
 
         resume();
         if (SUCCEEDED(result) && blurred) {
-            backing_target_->PushAxisAlignedClip(d2dRect(target), D2D1_ANTIALIAS_MODE_ALIASED);
-            backing_target_->DrawBitmap(blurred, d2dRect(target), opacity,
+            ctx()->PushAxisAlignedClip(d2dRect(target), D2D1_ANTIALIAS_MODE_ALIASED);
+            ctx()->DrawBitmap(blurred, d2dRect(target), opacity,
                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, nullptr);
-            backing_target_->PopAxisAlignedClip();
+            ctx()->PopAxisAlignedClip();
         }
         releaseCom(sample_brush);
         releaseCom(blurred);
@@ -1832,9 +2419,9 @@ private:
                  * patch must cost no more than any other culled command. */
                 const Rect target = blurTarget(*command, outer_clip);
                 if (empty(target) || command->effect.blur <= 0 || command->opacity <= 0) continue;
-                const HRESULT segment = backing_target_->EndDraw();
+                const HRESULT segment = ctx()->EndDraw();
                 if (FAILED(segment)) {
-                    backing_target_->BeginDraw();
+                    ctx()->BeginDraw();
                     return false;
                 }
                 if (!resumeAndDrawBlur(*command, target)) return false;
@@ -1847,12 +2434,12 @@ private:
 
     bool drawCommand(const Command &command, const Rect *outer_clip) {
         if (outer_clip && !intersects(command.bounds, *outer_clip)) return true;
-        backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (outer_clip) backing_target_->PushAxisAlignedClip(d2dRect(*outer_clip), D2D1_ANTIALIAS_MODE_ALIASED);
-        if (command.has_clip) backing_target_->PushAxisAlignedClip(d2dRect(command.clip), D2D1_ANTIALIAS_MODE_ALIASED);
+        ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (outer_clip) ctx()->PushAxisAlignedClip(d2dRect(*outer_clip), D2D1_ANTIALIAS_MODE_ALIASED);
+        if (command.has_clip) ctx()->PushAxisAlignedClip(d2dRect(command.clip), D2D1_ANTIALIAS_MODE_ALIASED);
         if (command.has_transform) {
             const Affine &value = command.transform;
-            backing_target_->SetTransform(D2D1::Matrix3x2F(value.a, value.b, value.c, value.d, value.tx, value.ty));
+            ctx()->SetTransform(D2D1::Matrix3x2F(value.a, value.b, value.c, value.d, value.tx, value.ty));
         }
         bool ok = false;
         switch (command.kind) {
@@ -1875,9 +2462,9 @@ private:
                 ok = false;
                 break;
         }
-        backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (command.has_clip) backing_target_->PopAxisAlignedClip();
-        if (outer_clip) backing_target_->PopAxisAlignedClip();
+        ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (command.has_clip) ctx()->PopAxisAlignedClip();
+        if (outer_clip) ctx()->PopAxisAlignedClip();
         return ok;
     }
 
@@ -1927,30 +2514,30 @@ private:
     }
 
     bool renderCommands(const std::vector<const Command *> &commands, const DecodedPacket &packet, Color clear, bool full_surface) {
-        backing_target_->BeginDraw();
-        backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
+        const GpuProfileSpan profile_span(gpuProfileActive(), &profile_render_ns_);
+        beginOn(backing_bitmap_);
         bool ok = true;
         if (full_surface) {
-            backing_target_->Clear(d2dColor(clear));
+            ctx()->Clear(d2dColor(clear));
             ok = drawCommandList(commands, nullptr);
         } else if (packet.has_scissor) {
             std::vector<Rect> regions = packet.dirty_rects;
             if (regions.empty()) regions.push_back(packet.scissor);
             ID2D1SolidColorBrush *clear_brush = nullptr;
-            if (FAILED(backing_target_->CreateSolidColorBrush(d2dColor(clear), &clear_brush))) ok = false;
+            if (FAILED(ctx()->CreateSolidColorBrush(d2dColor(clear), &clear_brush))) ok = false;
             for (const Rect &source_region : regions) {
                 if (!ok) break;
                 Rect region = intersection(normalized(source_region), normalized(packet.scissor));
                 region = intersection(region, Rect{0, 0, static_cast<float>(surface_width_), static_cast<float>(surface_height_)});
                 if (empty(region)) continue;
-                backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-                backing_target_->PushAxisAlignedClip(d2dRect(region), D2D1_ANTIALIAS_MODE_ALIASED);
+                ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
+                ctx()->PushAxisAlignedClip(d2dRect(region), D2D1_ANTIALIAS_MODE_ALIASED);
                 /* Normal gpu_surface windows are opaque; source-over is
                  * therefore byte-equivalent to copy-clear here. Alpha
                  * top-level windows intentionally use the pixel path. */
-                backing_target_->FillRectangle(d2dRect(region), clear_brush);
-                backing_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-                backing_target_->PopAxisAlignedClip();
+                ctx()->FillRectangle(d2dRect(region), clear_brush);
+                ctx()->SetTransform(D2D1::Matrix3x2F::Identity());
+                ctx()->PopAxisAlignedClip();
                 if (!drawCommandList(commands, &region)) { ok = false; break; }
             }
             releaseCom(clear_brush);
@@ -1959,27 +2546,71 @@ private:
              * supplied command list without clearing retained pixels. */
             ok = drawCommandList(commands, nullptr);
         }
-        const HRESULT end = backing_target_->EndDraw();
+        const HRESULT end = endOn();
         if (!ok) return false;
         if (FAILED(end)) {
-            releaseDeviceResources(true);
+            handleDeviceLoss(end);
             return false;
         }
-        releaseCom(backing_bitmap_);
-        if (FAILED(backing_target_->GetBitmap(&backing_bitmap_)) || !backing_bitmap_) {
-            releaseDeviceResources(true);
-            return false;
-        }
+        /* No GetBitmap round trip any more: `backing_bitmap_` is the
+         * target that was just drawn into, and it outlives this call. */
         content_valid_ = true;
         return true;
     }
 
     std::shared_ptr<GpuRendererImpl> renderer_;
     HWND hwnd_ = nullptr;
-    ID2D1HwndRenderTarget *window_target_ = nullptr;
-    ID2D1BitmapRenderTarget *backing_target_ = nullptr;
-    ID2D1Bitmap *backing_bitmap_ = nullptr;
+    /* Stable per-surface identity for the profile log. `seq` counts
+     * presents PER SURFACE, so in an app with several gpu_surfaces (a
+     * video editor has a dozen) sequence numbers collide across surfaces
+     * and any reducer that groups by seq alone silently mixes them. */
+    unsigned surface_id_ = 0;
+    /* The retained content surface. Device-owned (not target-owned as the
+     * old CreateCompatibleRenderTarget bitmap was), which is what lets the
+     * image cache outlive a resize in the next phase. */
+    ID2D1Bitmap1 *backing_bitmap_ = nullptr;
+    /* Presentation: the flip-model swap chain and a D2D view of its back
+     * buffer. CANNOT_DRAW because nothing ever samples from it -- it is
+     * written once per paint and handed to the compositor. */
+    IDXGISwapChain1 *swap_chain_ = nullptr;
+    ID2D1Bitmap1 *swap_bitmap_ = nullptr;
+    /* ALLOCATED buffer extent, on the granularity grid -- not the client
+     * size. `source_*` is the client-sized region actually presented out
+     * of it, and is what damage and dirty rects are measured against. */
+    UINT swap_width_ = 0;
+    UINT swap_height_ = 0;
+    UINT source_width_ = 0;
+    UINT source_height_ = 0;
+    /* Surface scale the D2D view of buffer 0 was created at; a DPI change
+     * has to rebuild it even when the buffers themselves are unchanged. */
+    double swap_bitmap_scale_ = 0;
+    Color swap_background_ = {};
+    bool swap_background_applied_ = false;
+    /* Buffer allocations (create + every ResizeBuffers) since launch.
+     * Reported on the profile line, because "the grid is working" is not
+     * observable from timings alone. */
+    uint64_t swap_alloc_count_ = 0;
+    /* Damage bookkeeping for the partial copy. `swap_last_damage_` is the
+     * previous paint's damage; `swap_history_valid_` says the buffers hold
+     * a known frame history at all (false right after create/resize/loss,
+     * when their contents are undefined). See `paintRects`. */
+    std::vector<RECT> swap_last_damage_;
+    bool swap_history_valid_ = false;
+    /* `NATIVE_SDK_GPU_FULL_PRESENT=1` pins every paint to the
+     * full-surface copy and plain Present. It exists to A/B the partial
+     * path against itself on one build and one workload, and to bisect a
+     * suspected damage-tracking artifact without a rebuild. */
+    const bool force_full_present_ = envFlagSet(L"NATIVE_SDK_GPU_FULL_PRESENT");
+    const unsigned simulate_loss_after_ = envCount(L"NATIVE_SDK_GPU_SIMULATE_DEVICE_LOSS");
+    unsigned paints_since_start_ = 0;
+    /* 1x1 CPU-readable staging bitmap for `readColorAt`. Replaces the
+     * GDI-interop read, which required the backing surface to be
+     * GDI_COMPATIBLE -- a constraint a device-context target cannot
+     * carry. See the comment there. */
+    ID2D1Bitmap1 *readback_bitmap_ = nullptr;
     ID2D1Bitmap *blur_snapshot_ = nullptr;
+    /* Renderer device generation these resources were built against. */
+    uint64_t device_generation_ = 0;
     ID2D1StrokeStyle *rect_stroke_ = nullptr;
     ID2D1StrokeStyle *butt_stroke_ = nullptr;
     ID2D1StrokeStyle *round_stroke_ = nullptr;
@@ -1997,9 +2628,62 @@ private:
     uint32_t pixel_width_ = 0;
     uint32_t pixel_height_ = 0;
     bool content_valid_ = false;
+
+    /* `NATIVE_SDK_GPU_PROFILE` accumulators, reset per present. Untouched
+     * and never read when the profiler is off (see `GpuProfileLog`). */
+    uint64_t profile_sequence_ = 0;
+    uint64_t profile_targets_ns_ = 0;
+    uint64_t profile_image_ns_ = 0;
+    uint64_t profile_render_ns_ = 0;
+    uint64_t profile_image_bytes_ = 0;
+    size_t profile_flushed_bitmaps_ = 0;
+    uint32_t profile_image_uploads_ = 0;
+    /* Present's own cost, split out of the paint span: with sync
+     * interval 0 and a two-deep flip queue this is where the UI thread
+     * waits for a free back buffer, and that wait is not copy work. */
+    uint64_t profile_swap_present_ns_ = 0;
+    size_t profile_swap_dirty_rects_ = 0;
+    bool profile_swap_full_copy_ = false;
+    uint64_t profile_swap_damage_px_ = 0;
+    bool profile_swap_exact_ = false;
+    bool profile_swap_history_ = false;
+    bool profile_target_rebuild_ = false;
 };
 
 int GpuSurfaceImpl::present(const WindowsGpuPacketPresent &present, WindowsGpuPresentInfo *info) {
+    if (!gpuProfileActive()) return presentPacket(present, info);
+    profile_sequence_ += 1;
+    profile_targets_ns_ = 0;
+    profile_image_ns_ = 0;
+    profile_render_ns_ = 0;
+    profile_image_bytes_ = 0;
+    profile_flushed_bitmaps_ = 0;
+    profile_image_uploads_ = 0;
+    profile_target_rebuild_ = false;
+    const uint64_t begin_ns = gpuClockNs();
+    const int outcome = presentPacket(present, info);
+    const uint64_t total_ns = gpuClockNs() - begin_ns;
+    GpuProfileLog::shared().line(
+        "present surface=%u seq=%llu outcome=%d pw=%u ph=%u rebuild=%d flushed=%llu targets_us=%llu "
+        "images_us=%llu images_n=%u image_kib=%llu render_us=%llu decode_us=%llu total_us=%llu",
+        surface_id_,
+        static_cast<unsigned long long>(profile_sequence_),
+        outcome,
+        pixel_width_,
+        pixel_height_,
+        profile_target_rebuild_ ? 1 : 0,
+        static_cast<unsigned long long>(profile_flushed_bitmaps_),
+        static_cast<unsigned long long>(gpuProfileMicros(profile_targets_ns_)),
+        static_cast<unsigned long long>(gpuProfileMicros(profile_image_ns_)),
+        profile_image_uploads_,
+        static_cast<unsigned long long>(profile_image_bytes_ / 1024),
+        static_cast<unsigned long long>(gpuProfileMicros(profile_render_ns_)),
+        static_cast<unsigned long long>(gpuProfileMicros(info ? info->decode_ns : 0)),
+        static_cast<unsigned long long>(gpuProfileMicros(total_ns)));
+    return outcome;
+}
+
+int GpuSurfaceImpl::presentPacket(const WindowsGpuPacketPresent &present, WindowsGpuPresentInfo *info) {
     if (info) *info = {};
     /* A no-change packet is normally a cheap completion. After device
      * loss there is no retained bitmap to paint, though: decode the same
@@ -2072,6 +2756,13 @@ int GpuSurfaceImpl::present(const WindowsGpuPacketPresent &present, WindowsGpuPr
         if (patch) retained_valid_ = false;
         return 0;
     }
+    /* Before touching any GPU resource: a device removed since the last
+     * frame leaves this surface holding a backing bitmap, a swap chain,
+     * and a texture cache that all belong to it. `syncDevice` drops them
+     * and adopts the rebuilt stack; a refused present here makes the
+     * runtime resend a full packet, which is exactly the resync a fresh
+     * device needs. */
+    if (!syncDevice()) return 0;
     if (!ensureTargets(present.surface_width, present.surface_height, scale, pixel_width, pixel_height)) {
         releaseDeviceResources(true);
         return 0;
@@ -2169,83 +2860,356 @@ int GpuSurfaceImpl::present(const WindowsGpuPacketPresent &present, WindowsGpuPr
 }
 
 bool GpuSurfaceImpl::paint(const RECT *paint_rects, size_t paint_rect_count) {
+    if (!gpuProfileActive()) return paintRects(paint_rects, paint_rect_count);
+    /* `content` and `rects` together separate a real blit from the two
+     * shapes that return in nanoseconds without drawing: no retained
+     * bitmap yet, and an empty update region. Both report ok=1, so without
+     * these a reducer averages them in and understates the copy. */
+    const bool had_content = content_valid_ && backing_bitmap_ != nullptr;
+    profile_swap_present_ns_ = 0;
+    profile_swap_dirty_rects_ = 0;
+    profile_swap_damage_px_ = 0;
+    profile_swap_full_copy_ = false;
+    const uint64_t begin_ns = gpuClockNs();
+    const bool ok = paintRects(paint_rects, paint_rect_count);
+    const uint64_t blit_ns = gpuClockNs() - begin_ns;
+    GpuProfileLog::shared().line(
+        "paint surface=%u seq=%llu ok=%d content=%d pw=%u ph=%u rects=%llu blit_us=%llu present_us=%llu "
+        "full=%d dirty=%llu dmg_px=%llu exact=%d hist=%d sw=%u sh=%u aw=%u ah=%u allocs=%llu",
+        surface_id_,
+        static_cast<unsigned long long>(profile_sequence_),
+        ok ? 1 : 0,
+        had_content ? 1 : 0,
+        pixel_width_,
+        pixel_height_,
+        static_cast<unsigned long long>(paint_rect_count),
+        static_cast<unsigned long long>(gpuProfileMicros(blit_ns)),
+        static_cast<unsigned long long>(gpuProfileMicros(profile_swap_present_ns_)),
+        profile_swap_full_copy_ ? 1 : 0,
+        static_cast<unsigned long long>(profile_swap_dirty_rects_),
+        static_cast<unsigned long long>(profile_swap_damage_px_),
+        profile_swap_exact_ ? 1 : 0,
+        profile_swap_history_ ? 1 : 0,
+        /* sw/sh stay the PRESENTED extent -- the damage-coverage
+         * denominator every reducer already divides by. aw/ah are the
+         * allocation behind it, and `allocs` counts the buffer
+         * reallocations this surface has paid for since launch: the one
+         * number that says whether the granularity grid is working. */
+        source_width_,
+        source_height_,
+        swap_width_,
+        swap_height_,
+        static_cast<unsigned long long>(swap_alloc_count_));
+    return ok;
+}
+
+bool GpuSurfaceImpl::paintRects(const RECT *paint_rects, size_t paint_rect_count) {
+    if (!syncDevice()) return false;
     if (!content_valid_ || !backing_bitmap_) return true;
     if (paint_rect_count > 0 && paint_rects == nullptr) return false;
-    if (!ensureWindowTarget()) return false;
     RECT client = {};
-    if (!GetClientRect(hwnd_, &client)) return false;
+    if (!hwnd_ || !GetClientRect(hwnd_, &client)) return false;
     const UINT client_width = static_cast<UINT>(std::max<LONG>(1, client.right - client.left));
     const UINT client_height = static_cast<UINT>(std::max<LONG>(1, client.bottom - client.top));
-    const D2D1_SIZE_U current = window_target_->GetPixelSize();
-    if ((current.width != client_width || current.height != client_height) &&
-        FAILED(window_target_->Resize(D2D1::SizeU(client_width, client_height)))) {
+    if (!ensureSwapChain(client_width, client_height)) {
         releaseDeviceResources(true);
         return false;
     }
-    window_target_->SetDpi(static_cast<FLOAT>(96.0 * scale_), static_cast<FLOAT>(96.0 * scale_));
+    if (simulate_loss_after_ > 0 && ++paints_since_start_ == simulate_loss_after_) {
+        /* NATIVE_SDK_GPU_SIMULATE_DEVICE_LOSS=<n>: take the recovery path
+         * on the nth paint. Disabling an adapter mid-drag is the honest
+         * test but not a repeatable one, and this exercises the same
+         * code -- rebuild the stack, drop every surface's resources,
+         * force a full resync -- on demand. */
+        handleDeviceLoss(DXGI_ERROR_DEVICE_REMOVED);
+        return false;
+    }
+
+    /* `WM_PAINT` remains the presentation trigger (the plan's option (a)):
+     * the host still invalidates and Windows still decides when to paint;
+     * this call ends in Present instead of a blt through the DWM
+     * redirection surface. Moving presentation into `present()` --
+     * option (b) -- is a separate, deliberate change.
+     *
+     * How much gets copied is the interesting part.
+     *
+     * Under the blt model `paint()` clipped the copy to the update
+     * region, because the redirection surface persisted and untouched
+     * pixels were already last frame's. A flip-model back buffer does not
+     * persist: with `BufferCount = 2` the buffer about to be drawn is the
+     * one presented TWO frames ago. So the region that must be refreshed
+     * is not this paint's damage alone, it is
+     *
+     *     damage(this paint) UNION damage(previous paint)
+     *
+     * -- everything that has changed since the pixels currently sitting
+     * in this buffer were correct. Copy that and the whole buffer equals
+     * the current frame again, which is exactly the precondition
+     * `Present1` states before it will honour dirty rects. The dirty
+     * rects themselves are this paint's damage alone, because they
+     * describe the delta against the PREVIOUSLY PRESENTED frame.
+     *
+     * `swap_history_valid_` is the guard: right after a create, a
+     * `ResizeBuffers`, or a device loss the buffers hold undefined
+     * pixels, no history exists, and the copy has to be full.
+     *
+     * (`CopyFromBitmap` would be the cheaper primitive for the full case
+     * but is unavailable: it requires identical D2D pixel formats, and
+     * the backing surface is PREMULTIPLIED while a flip-model HWND swap
+     * chain's D2D view must be ALPHA_MODE_IGNORE -- E_INVALIDARG on that
+     * pair. Aligning the backing surface to IGNORE would change the blend
+     * semantics every layer and opacity group renders under, which is not
+     * a trade worth making for a presentation change.) */
+    applyBackgroundColor();
+
+    /* Against the PRESENTED region, not the allocation. The buffers are
+     * rounded up to the granularity grid, so their pixel size says nothing
+     * about whether the backing surface and the window agree -- and a
+     * dirty rect outside the source region is not a valid dirty rect. */
+    const D2D1_SIZE_U backing_pixels = backing_bitmap_->GetPixelSize();
+    const bool exact = backing_pixels.width == source_width_ && backing_pixels.height == source_height_;
+
+    std::vector<RECT> damage;
+    damage.reserve(paint_rect_count);
+    for (size_t index = 0; index < paint_rect_count; ++index) {
+        RECT clamped = paint_rects[index];
+        clamped.left = std::max<LONG>(0, clamped.left);
+        clamped.top = std::max<LONG>(0, clamped.top);
+        clamped.right = std::min<LONG>(static_cast<LONG>(source_width_), clamped.right);
+        clamped.bottom = std::min<LONG>(static_cast<LONG>(source_height_), clamped.bottom);
+        if (clamped.right > clamped.left && clamped.bottom > clamped.top) damage.push_back(clamped);
+    }
+    /* An empty update region is nothing to show. Presenting anyway would
+     * flip a buffer holding a two-frames-old image to the front. */
+    if (damage.empty()) return true;
+
     const float logical_client_width = static_cast<float>(client_width / scale_);
     const float logical_client_height = static_cast<float>(client_height / scale_);
-    window_target_->BeginDraw();
-    window_target_->SetTransform(D2D1::Matrix3x2F::Identity());
-    for (size_t index = 0; index < paint_rect_count; ++index) {
-        const RECT &paint_rect = paint_rects[index];
-        const Rect clip = {
-            static_cast<float>(paint_rect.left / scale_),
-            static_cast<float>(paint_rect.top / scale_),
-            static_cast<float>((paint_rect.right - paint_rect.left) / scale_),
-            static_cast<float>((paint_rect.bottom - paint_rect.top) / scale_),
+
+    /* Where the retained image lands. Deliberately NOT the client rect.
+     *
+     * Between a resize step and the packet that re-renders at the new
+     * size, `backing_bitmap_` still holds the PREVIOUS size's pixels.
+     * Drawing those into the new client rect stretches a whole surface's
+     * image to a size the app never laid out, and every anchored thing
+     * inside it slides and distorts for as long as the drag runs: a menu
+     * bar pulls away from its own left edge, a right-flush caption
+     * cluster smears, glyphs resample a fraction of a pixel on every
+     * step. The window's contents read as rubber.
+     *
+     * Anchored at the top-left and drawn at the size it was rendered,
+     * every retained pixel stays where the app put it. The only wrong
+     * region is then the strip the window has just gained, and that is
+     * cleared below. A stale POSITION for one frame is invisible; a
+     * stale SHAPE is not.
+     *
+     * A sub-pixel disagreement is not staleness and must keep scaling.
+     * The backing surface is sized from the packet
+     * (`ceil(logical * scale)`) and the swap chain from `GetClientRect`,
+     * so at fractional DPI the two differ by a pixel indefinitely --
+     * 1349x895 against 1348x894 at 125%. Anchoring that would leave a
+     * permanent hairline of cleared pixels down two edges. */
+    const auto pixel_delta = [](UINT a, UINT b) { return a > b ? a - b : b - a; };
+    const UINT delta_width = pixel_delta(backing_pixels.width, source_width_);
+    const UINT delta_height = pixel_delta(backing_pixels.height, source_height_);
+    const float content_width = delta_width <= 1
+        ? logical_client_width
+        : static_cast<float>(backing_pixels.width / scale_);
+    const float content_height = delta_height <= 1
+        ? logical_client_height
+        : static_cast<float>(backing_pixels.height / scale_);
+    const D2D1_RECT_F whole = D2D1::RectF(0, 0, content_width, content_height);
+    /* Exactly the one-pixel case resamples: zero already matches the
+     * window, and anything larger is drawn at its own extent. Each axis
+     * decides for itself -- a band whose width is a resize behind and
+     * whose height is one DPI-rounded pixel off is the common shape. */
+    const D2D1_INTERPOLATION_MODE sampling = (delta_width == 1 || delta_height == 1)
+        ? D2D1_INTERPOLATION_MODE_LINEAR
+        : D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
+    /* A window that grew leaves the retained image short of its own
+     * client rect. Those pixels are not background: a flip-model back
+     * buffer holds the frame presented two flips ago. */
+    const bool uncovered = content_width < logical_client_width || content_height < logical_client_height;
+
+    /* `full_copy` stays NOT gated on `exact`: treating the fractional-DPI
+     * pixel above as a reason to copy everything meant the partial path
+     * essentially never ran, and a partial copy is just as correct when
+     * the blit scales -- it draws the same scaled image the full copy
+     * would, clipped to the damage.
+     *
+     * An uncovered strip IS a reason. It has to be repainted on every
+     * flip until the app renders at the new size, and it lies outside
+     * this paint's damage, so a partial copy would present it stale. */
+    const bool full_copy = force_full_present_ || !swap_history_valid_ || uncovered ||
+        damage.size() + swap_last_damage_.size() > kSwapDirtyRectCap;
+
+    beginOn(swap_bitmap_);
+    if (full_copy) {
+        if (uncovered) {
+            /* The clear colour is by construction the colour that strip
+             * is about to be painted -- the same reasoning
+             * `applyBackgroundColor` runs on, and the same opaque
+             * treatment, the swap chain's D2D view being ALPHA_MODE_IGNORE. */
+            const D2D1_COLOR_F fill = D2D1::ColorF(
+                clamp01(clear_color_.r), clamp01(clear_color_.g), clamp01(clear_color_.b), 1.0f);
+            const auto clear_strip = [&](const D2D1_RECT_F &strip) {
+                if (strip.right <= strip.left || strip.bottom <= strip.top) return;
+                ctx()->PushAxisAlignedClip(strip, D2D1_ANTIALIAS_MODE_ALIASED);
+                ctx()->Clear(fill);
+                ctx()->PopAxisAlignedClip();
+            };
+            clear_strip(D2D1::RectF(content_width, 0, logical_client_width, logical_client_height));
+            clear_strip(D2D1::RectF(0, content_height, content_width, logical_client_height));
+        }
+        ctx()->DrawBitmap(backing_bitmap_, whole, 1.0f, sampling, nullptr, nullptr);
+    } else {
+        auto copy_region = [&](const RECT &pixels) {
+            /* Device pixels to logical, outset by one pixel each way so
+             * the fractional-scale rounding can never leave a seam of
+             * two-frames-old content along a damage edge. */
+            const D2D1_RECT_F clip = D2D1::RectF(
+                static_cast<float>((pixels.left - 1) / scale_),
+                static_cast<float>((pixels.top - 1) / scale_),
+                static_cast<float>((pixels.right + 1) / scale_),
+                static_cast<float>((pixels.bottom + 1) / scale_));
+            ctx()->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            ctx()->DrawBitmap(backing_bitmap_, whole, 1.0f, sampling, nullptr, nullptr);
+            ctx()->PopAxisAlignedClip();
         };
-        if (empty(clip)) continue;
-        window_target_->PushAxisAlignedClip(d2dRect(clip), D2D1_ANTIALIAS_MODE_ALIASED);
-        window_target_->DrawBitmap(backing_bitmap_,
-            D2D1::RectF(0, 0, logical_client_width, logical_client_height), 1.0f,
-            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, nullptr);
-        window_target_->PopAxisAlignedClip();
+        for (const RECT &region : damage) copy_region(region);
+        for (const RECT &region : swap_last_damage_) copy_region(region);
     }
-    const HRESULT result = window_target_->EndDraw();
-    if (result == D2DERR_RECREATE_TARGET || FAILED(result)) {
-        releaseDeviceResources(true);
+    const HRESULT drawn = endOn();
+    if (drawn == D2DERR_RECREATE_TARGET || FAILED(drawn)) {
+        if (gpuProfileActive()) {
+            GpuProfileLog::shared().line("paint-fail stage=copy hr=0x%08x bw=%u bh=%u sw=%u sh=%u aw=%u ah=%u",
+                static_cast<unsigned>(drawn), backing_pixels.width, backing_pixels.height,
+                source_width_, source_height_, swap_width_, swap_height_);
+        }
+        handleDeviceLoss(drawn);
         return false;
     }
+
+    /* Sync interval 0: the host already paces frames against the
+     * monitor's refresh, and blocking the UI thread inside Present would
+     * put that pacing behind DXGI's. */
+    const uint64_t present_begin_ns = gpuProfileActive() ? gpuClockNs() : 0;
+    HRESULT presented = S_OK;
+    if (full_copy) {
+        presented = swap_chain_->Present(0, 0);
+    } else {
+        DXGI_PRESENT_PARAMETERS parameters = {};
+        parameters.DirtyRectsCount = static_cast<UINT>(damage.size());
+        parameters.pDirtyRects = damage.data();
+        presented = swap_chain_->Present1(0, 0, &parameters);
+    }
+    if (gpuProfileActive()) {
+        profile_swap_present_ns_ = gpuClockNs() - present_begin_ns;
+        profile_swap_full_copy_ = full_copy;
+        profile_swap_dirty_rects_ = full_copy ? 0 : damage.size();
+        profile_swap_exact_ = exact;
+        profile_swap_history_ = swap_history_valid_;
+        /* Damage coverage is what decides whether the partial path can
+         * ever help this app: a workload that invalidates its whole
+         * surface every frame has nothing for dirty rects to save, and
+         * without this field that looks identical to a broken
+         * optimization. Counted over the copied union, not just this
+         * paint's rects, because that is the work actually done. */
+        profile_swap_damage_px_ = 0;
+        for (const RECT &region : damage) {
+            profile_swap_damage_px_ += static_cast<uint64_t>(region.right - region.left) *
+                static_cast<uint64_t>(region.bottom - region.top);
+        }
+        if (!full_copy) {
+            for (const RECT &region : swap_last_damage_) {
+                profile_swap_damage_px_ += static_cast<uint64_t>(region.right - region.left) *
+                    static_cast<uint64_t>(region.bottom - region.top);
+            }
+        }
+    }
+    if (presented == DXGI_STATUS_OCCLUDED) {
+        /* Ground truth that the window is hidden. Not a failure, and
+         * deliberately not wired into the existing occluded-pacing
+         * heuristics -- that interacts with frame scheduling and is a
+         * separate change.
+         *
+         * The buffers did not rotate, so the damage history did not
+         * advance either; leave it alone. */
+        return true;
+    }
+    if (FAILED(presented)) {
+        if (gpuProfileActive()) {
+            GpuProfileLog::shared().line("paint-fail stage=present hr=0x%08x", static_cast<unsigned>(presented));
+        }
+        handleDeviceLoss(presented);
+        return false;
+    }
+    swap_last_damage_ = std::move(damage);
+    swap_history_valid_ = true;
     return true;
 }
 
+/* Hidden-titlebar caption sampling, and its only caller.
+ *
+ * This used to run through `ID2D1GdiInteropRenderTarget::GetDC` +
+ * `GetPixel`, which is why the backing surface carried
+ * `D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_GDI_COMPATIBLE`. A
+ * device-context target cannot carry that flag, so the read is now a
+ * D2D1.1 CPU-readable staging bitmap: copy the one pixel, map it, read
+ * BGRA. Same single-pixel synchronization point, no GDI, and the
+ * GDI_COMPATIBLE constraint is gone from the whole renderer.
+ *
+ * (The migration plan scheduled this as Phase 5. It cannot be deferred:
+ * the flag it removes lives on the `CreateCompatibleRenderTarget` call
+ * that Phase 2 deletes.) */
 bool GpuSurfaceImpl::readColorAt(double logical_x, double logical_y, uint32_t *color) {
-    if (!color || !content_valid_ || !backing_target_ || !backing_bitmap_ || !(scale_ > 0) ||
+    if (!color || !content_valid_ || !backing_bitmap_ || !(scale_ > 0) ||
         !std::isfinite(logical_x) || !std::isfinite(logical_y)) return false;
     const double pixel_x_value = std::floor(logical_x * scale_);
     const double pixel_y_value = std::floor(logical_y * scale_);
     if (pixel_x_value < 0 || pixel_y_value < 0 ||
         pixel_x_value >= pixel_width_ || pixel_y_value >= pixel_height_) return false;
 
-    ID2D1GdiInteropRenderTarget *interop = nullptr;
-    HRESULT result = backing_target_->QueryInterface(
-        __uuidof(ID2D1GdiInteropRenderTarget), reinterpret_cast<void **>(&interop));
-    if (FAILED(result) || !interop) {
-        releaseCom(interop);
-        return false;
+    if (!readback_bitmap_) {
+        const D2D1_BITMAP_PROPERTIES1 properties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        if (FAILED(ctx()->CreateBitmap(D2D1::SizeU(1, 1), nullptr, 0, properties, &readback_bitmap_)) ||
+            !readback_bitmap_) {
+            releaseCom(readback_bitmap_);
+            return false;
+        }
     }
 
-    /* The backing target alone is GDI-compatible. COPY synchronizes its
-     * retained GPU bitmap into the returned DC, and GetPixel reads exactly
-     * one device pixel. Hidden-titlebar caption sampling is the sole caller,
-     * so ordinary packet frames never pay this synchronization cost. */
-    backing_target_->BeginDraw();
-    HDC dc = nullptr;
-    result = interop->GetDC(D2D1_DC_INITIALIZE_MODE_COPY, &dc);
-    COLORREF sampled = CLR_INVALID;
-    HRESULT released = S_OK;
-    if (SUCCEEDED(result) && dc) {
-        sampled = GetPixel(dc, static_cast<int>(pixel_x_value), static_cast<int>(pixel_y_value));
-        released = interop->ReleaseDC(nullptr);
+    const D2D1_POINT_2U destination = D2D1::Point2U(0, 0);
+    const D2D1_RECT_U source = D2D1::RectU(
+        static_cast<UINT32>(pixel_x_value), static_cast<UINT32>(pixel_y_value),
+        static_cast<UINT32>(pixel_x_value) + 1, static_cast<UINT32>(pixel_y_value) + 1);
+    if (FAILED(readback_bitmap_->CopyFromBitmap(&destination, backing_bitmap_, &source))) return false;
+
+    D2D1_MAPPED_RECT mapped = {};
+    const HRESULT map_result = readback_bitmap_->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+    if (gpuProfileActive()) {
+        /* The caller silently falls back to the retained-command colour
+         * estimate when this returns false, so without a line here a
+         * broken readback looks exactly like a working one. */
+        GpuProfileLog::shared().line("readback seq=%llu hr=0x%08x x=%d y=%d",
+            static_cast<unsigned long long>(profile_sequence_), static_cast<unsigned>(map_result),
+            static_cast<int>(pixel_x_value), static_cast<int>(pixel_y_value));
     }
-    const HRESULT ended = backing_target_->EndDraw();
-    releaseCom(interop);
-    if (FAILED(result) || FAILED(released) || FAILED(ended) || sampled == CLR_INVALID) return false;
+    if (FAILED(map_result) || !mapped.bits) return false;
+    const uint8_t blue = mapped.bits[0];
+    const uint8_t green = mapped.bits[1];
+    const uint8_t red = mapped.bits[2];
+    const HRESULT unmapped = readback_bitmap_->Unmap();
+    if (FAILED(unmapped)) return false;
+    /* The caller wants an opaque caption colour; the backing surface is
+     * opaque by construction, so the source alpha carries no information
+     * and premultiplication is a no-op. */
     *color = 0xff000000u |
-        (static_cast<uint32_t>(GetRValue(sampled)) << 16) |
-        (static_cast<uint32_t>(GetGValue(sampled)) << 8) |
-        static_cast<uint32_t>(GetBValue(sampled));
+        (static_cast<uint32_t>(red) << 16) |
+        (static_cast<uint32_t>(green) << 8) |
+        static_cast<uint32_t>(blue);
     return true;
 }
 

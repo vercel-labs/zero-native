@@ -2761,7 +2761,12 @@ fn linkPlatform(b: *std.Build, dep: *std.Build.Dependency, target: std.Build.Res
         // Retained gpu_surface packets are composited into a hardware
         // Direct2D target; DirectWrite draws the engine-measured text
         // runs (including registered in-memory fonts) on that target.
+        // The D2D device sits on a D3D11 device created with
+        // BGRA_SUPPORT, and reaches the compositor through a DXGI 1.2
+        // flip-model swap chain -- hence d3d11 and dxgi.
         app_mod.linkSystemLibrary("d2d1", .{});
+        app_mod.linkSystemLibrary("d3d11", .{});
+        app_mod.linkSystemLibrary("dxgi", .{});
         app_mod.linkSystemLibrary("dwrite", .{});
         app_mod.linkSystemLibrary("imm32", .{});
         app_mod.linkSystemLibrary("comctl32", .{});
