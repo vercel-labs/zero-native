@@ -774,12 +774,15 @@ const Checker = struct {
     /// against the contract and the whole expression run through the
     /// shared type checker with those kinds — `{count > 'a'}` fails here
     /// with the evaluator's teaching message and the model field's type.
-    fn attrKind(self: *Checker, node: markup.MarkupNode, attribute: markup.MarkupAttr, raw: []const u8) CheckErr!?ValueKind {
+    fn expressionKind(self: *Checker, node: markup.MarkupNode, attribute: markup.MarkupAttr, raw: []const u8, attribute_aware: bool) CheckErr!?ValueKind {
         const expression = markup.parseAttrExpression(raw) orelse {
             return self.failAttr(node, attribute, markup.invalid_expression_message);
         };
         return switch (expression) {
-            .literal => |text| expr.kindOf(reflect.literalValue(text)),
+            .literal => |text| expr.kindOf(if (attribute_aware)
+                reflect.literalValueForAttribute(text, attribute.name)
+            else
+                reflect.literalValue(text)),
             .binding => |path| (try self.resolveBinding(node, path, true)).kind,
             .equals => |sides| blk: {
                 // Arena-computed bindings are excluded from equality on
@@ -791,6 +794,14 @@ const Checker = struct {
             },
             .expression => |inner| try self.exprTreeKind(node, inner),
         };
+    }
+
+    fn attrKind(self: *Checker, node: markup.MarkupNode, attribute: markup.MarkupAttr, raw: []const u8) CheckErr!?ValueKind {
+        return self.expressionKind(node, attribute, raw, true);
+    }
+
+    fn unclassifiedKind(self: *Checker, node: markup.MarkupNode, attribute: markup.MarkupAttr, raw: []const u8) CheckErr!?ValueKind {
+        return self.expressionKind(node, attribute, raw, false);
     }
 
     fn exprTreeKind(self: *Checker, node: markup.MarkupNode, inner: []const u8) CheckErr!?ValueKind {
@@ -1120,7 +1131,7 @@ const Checker = struct {
                 }
             }
         }
-        return .{ .value = try self.attrKind(node, attribute, attribute.value) };
+        return .{ .value = try self.unclassifiedKind(node, attribute, attribute.value) };
     }
 
     fn checkSlot(self: *Checker, node: markup.MarkupNode) CheckErr!void {

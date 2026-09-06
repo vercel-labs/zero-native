@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const expr = @import("ui_markup_expr.zig");
+const schema = @import("ui_schema.zig");
 
 /// Comptime walks over an app's Model and Msg scale with the type's
 /// field/decl count, and the default 1000-backwards-branch quota dies at
@@ -448,4 +449,16 @@ pub fn literalValue(text: []const u8) expr.Value {
     if (std.fmt.parseInt(i64, text, 10)) |int| return .{ .integer = int } else |_| {}
     if (std.fmt.parseFloat(f32, text)) |float| return .{ .float = float } else |_| {}
     return .{ .string = text };
+}
+
+/// A bare attribute literal keeps the schema's declared text shape. Text
+/// attributes are the one exception to the general literal inference above:
+/// `placeholder="123"` is text, while numeric, whole-number, flag, option,
+/// and key attributes retain their existing inference and truthiness rules.
+/// Expression literals and template defaults intentionally continue to use
+/// `literalValue` directly.
+pub fn literalValueForAttribute(text: []const u8, attribute_name: []const u8) expr.Value {
+    const info = schema.attrByName(attribute_name) orelse return literalValue(text);
+    if (info.class == .text) return .{ .string = text };
+    return literalValue(text);
 }
